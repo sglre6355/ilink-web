@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="stream" content="{{STREAM}}">
+<title>Link Camera</title>
+<style>
+  :root {
+    --bg: #f4f4f2; --panel: #ffffff; --fg: #1d1d1b; --muted: #6b6b66;
+    --line: #dcdcd6; --accent: #2f6fde; --btn: #ececE8; --btn-active: #d6d6d0; --err: #c0392b;
+    --stage: #0d0d0d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141414; --panel: #1e1e1e; --fg: #ececea; --muted: #9a9a95;
+      --line: #333; --accent: #6ea0ff; --btn: #2a2a2a; --btn-active: #3a3a3a; --err: #ff7b6b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { position: relative; display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+
+  /* Stage: the video fills the window on desktop; on touch screens it sits above the controls. */
+  .stage { position: relative; flex: 1 1 auto; min-height: 0; background: var(--stage);
+    container-type: size; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  @media (hover: none) {
+    body { height: auto; min-height: 100dvh; overflow: auto; }
+    .stage { flex: 0 0 auto; height: min(56.25vw, 75dvh); }
+  }
+  .frame { position: relative; aspect-ratio: 16 / 9; width: min(100cqw, 100cqh * 16 / 9);
+    cursor: crosshair; touch-action: manipulation; }
+  .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+    display: block; user-select: none; -webkit-user-drag: none; }
+  .cross { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px;
+    margin: -11px 0 0 -11px; pointer-events: none; opacity: .45; }
+  .cross::before, .cross::after { content: ""; position: absolute; background: #fff; }
+  .cross::before { left: 10px; top: 0; width: 2px; height: 22px; }
+  .cross::after { top: 10px; left: 0; height: 2px; width: 22px; }
+  .ping { position: absolute; width: 30px; height: 30px; margin: -15px 0 0 -15px; border: 2px solid #fff;
+    border-radius: 50%; pointer-events: none; animation: ping .6s ease-out forwards; }
+  @keyframes ping { from { transform: scale(.4); opacity: 1; } to { transform: scale(1.6); opacity: 0; } }
+  .msg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: rgba(0,0,0,.6); color: #fff; font-size: 14px; padding: 6px 14px; border-radius: 8px;
+    pointer-events: none; }
+  .msg:empty { display: none; }
+
+  /* HUD overlays */
+  .hud { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; gap: 8px;
+    align-items: flex-start; pointer-events: none; }
+  .pill { background: rgba(0,0,0,.5); color: #fff; border-radius: 8px; padding: 4px 10px; font-size: 13px;
+    font-variant-numeric: tabular-nums; backdrop-filter: blur(4px); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e74c3c;
+    margin-right: 6px; vertical-align: 1px; }
+  .dot.live { background: #2ecc71; }
+  .hud .err { background: rgba(160,30,20,.8); }
+  .hud .spacer { flex: 1; }
+  .hud button { pointer-events: auto; background: rgba(0,0,0,.5); color: #fff; border: 0; border-radius: 8px;
+    height: 30px; min-width: 34px; padding: 0 10px; font-size: 14px; cursor: pointer; backdrop-filter: blur(4px); }
+  .hud button:hover { background: rgba(0,0,0,.7); }
+
+  /* Controls: below the video on touch screens, a floating panel on desktop (toggle with H). */
+  .panel { background: var(--panel); border-top: 1px solid var(--line); padding: 14px 16px 18px;
+    display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; justify-items: center; }
+  .panel[hidden] { display: none; }
+  @media (hover: hover) and (pointer: fine) {
+    .panel { position: absolute; right: 16px; bottom: 16px; width: 300px; max-width: calc(100vw - 32px);
+      max-height: calc(100dvh - 32px); overflow: auto; border: 1px solid var(--line);
+      border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.35); }
+  }
+  .pad { display: grid; grid-template-columns: repeat(3, 60px); grid-template-rows: repeat(3, 60px); gap: 6px; }
+  button.b { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line);
+    border-radius: 10px; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; }
+  button.b:active, button.b.held { background: var(--btn-active); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pad button { font-size: 20px; }
+  .pad .c { font-size: 12px; }
+  .row { display: flex; gap: 8px; align-items: center; width: 100%; max-width: 360px; }
+  .row label { color: var(--muted); font-size: 13px; min-width: 40px; }
+  .seg { display: flex; flex: 1; }
+  .seg button { flex: 1; border-radius: 0; padding: 7px 0; font-size: 13px; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .zoom button { width: 38px; height: 34px; font-size: 18px; }
+  input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  .keys { font-size: 12px; color: var(--muted); text-align: center; line-height: 1.9; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  @media (hover: none) { .keys { display: none; } }
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <div class="frame" id="frame">
+    <img id="video" alt="Live camera view">
+    <div class="msg" id="msg">Connecting…</div>
+    <div class="cross"></div>
+  <div class="hud">
+    <div class="pill"><span class="dot" id="dot"></span><span id="pos">–</span></div>
+    <div class="pill err" id="status" hidden></div>
+    <div class="spacer"></div>
+    <button id="fs" title="Fullscreen (F)" aria-label="Fullscreen">⛶</button>
+    <button id="toggle" title="Show controls (H)" aria-label="Toggle controls" aria-expanded="false">⌨︎</button>
+  </div>
+  </div>
+</div>
+
+<div class="panel" id="panel" hidden>
+    <div class="pad">
+      <span></span><button class="b" data-d="0,1" aria-label="Tilt up">▲</button><span></span>
+      <button class="b" data-d="-1,0" aria-label="Pan left">◀</button>
+      <button class="b c" id="center" aria-label="Recenter">center</button>
+      <button class="b" data-d="1,0" aria-label="Pan right">▶</button>
+      <span></span><button class="b" data-d="0,-1" aria-label="Tilt down">▼</button><span></span>
+    </div>
+    <div class="row">
+      <label>Step</label>
+      <div class="seg" id="step">
+        <button class="b" data-v="1">1°</button><button class="b" data-v="5" aria-pressed="true">5°</button>
+        <button class="b" data-v="15">15°</button><button class="b" data-v="30">30°</button>
+      </div>
+    </div>
+    <div class="row zoom">
+      <label>Zoom</label>
+      <button class="b" id="zout" aria-label="Zoom out">−</button>
+      <input type="range" id="zoom" min="1" max="4" step="0.1" value="1" aria-label="Zoom">
+      <button class="b" id="zin" aria-label="Zoom in">+</button>
+    </div>
+    <div class="keys">
+      <kbd>←↑↓→</kbd> move &nbsp; <kbd>Shift</kbd> ×3 &nbsp; <kbd>1</kbd>–<kbd>4</kbd> step<br>
+      <kbd>+</kbd><kbd>−</kbd> / wheel zoom &nbsp; click aim &nbsp; <kbd>C</kbd> center<br>
+      <kbd>F</kbd> fullscreen &nbsp; <kbd>H</kbd> this panel
+    </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const touch = matchMedia('(hover: none)').matches;
+
+/* ---------- Video: read the MJPEG stream ourselves so we can reconnect ---------- */
+// Set by the server (--stream); ":PORT/path" means that port on this host.
+const streamSetting = document.querySelector('meta[name=stream]').content;
+const STREAM = streamSetting.startsWith(':')
+  ? `${location.protocol}//${location.hostname}${streamSetting}`
+  : streamSetting;
+const img = $('video');
+let streamCtl = null, lastFrame = 0, imgUrl = null;
+const CRLF2 = [13, 10, 13, 10];
+const dec = new TextDecoder();
+
+function find(buf, seq, from = 0) {
+  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+function showFrame(bytes) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
+  const old = imgUrl;
+  img.src = imgUrl = url;
+  if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
+  lastFrame = Date.now();
+}
+
+async function startStream() {
+  stopStream();
+  const ctl = new AbortController();
+  streamCtl = ctl;
+  try {
+    const res = await fetch(STREAM + '?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store' });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const nb = new Uint8Array(buf.length + value.length);
+      nb.set(buf); nb.set(value, buf.length); buf = nb;
+      for (;;) {
+        const h = find(buf, CRLF2);
+        if (h < 0) break;
+        const m = /content-length:\s*(\d+)/i.exec(dec.decode(buf.subarray(0, h)));
+        if (!m) { buf = buf.slice(h + 4); continue; }
+        const n = +m[1], start = h + 4;
+        if (buf.length < start + n) break;
+        showFrame(buf.slice(start, start + n));
+        buf = buf.slice(start + n);
+      }
+    }
+  } catch (e) { /* aborted or dropped: fall through to reconnect */ }
+  if (streamCtl === ctl && !document.hidden) setTimeout(startStream, 1000);
+}
+
+function stopStream() {
+  if (streamCtl) { const c = streamCtl; streamCtl = null; c.abort(); }
+}
+
+// Watchdog: reconnect if frames stop; pause while the tab is hidden (saves phone data).
+setInterval(() => {
+  const live = Date.now() - lastFrame < 3000;
+  $('dot').classList.toggle('live', live);
+  $('msg').textContent = live ? '' : (lastFrame ? 'Reconnecting…' : 'Connecting…');
+  if (!document.hidden && streamCtl && Date.now() - lastFrame > 6000 && Date.now() - streamStarted > 6000) {
+    streamStarted = Date.now(); startStream();
+  }
+}, 1000);
+let streamStarted = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopStream(); else { streamStarted = Date.now(); startStream(); }
+});
+window.addEventListener('pageshow', () => { if (!streamCtl) startStream(); });
+window.addEventListener('online', () => startStream());
+startStream();
+
+/* ---------- Gimbal control ---------- */
+// Approximate Link 2 field of view at zoom 1 (79.5° diagonal, 16:9).
+const HFOV = 71.9, VFOV = 44.4;
+const rad = d => d * Math.PI / 180, deg = r => r * 180 / Math.PI;
+let limits = { pan: [-145, 145], tilt: [-90, 100], zoom: [1, 4] };
+let target = null, lastCmd = 0, busy = false, pending = null, step = 5;
+const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
+
+function show(s) {
+  $('pos').textContent = `pan ${Math.round(s.pan)}°  tilt ${Math.round(s.tilt)}°  ${s.zoom.toFixed(1)}×`;
+  if (document.activeElement !== $('zoom')) $('zoom').value = s.zoom;
+}
+function status(msg) { $('status').textContent = msg || ''; $('status').hidden = !msg; }
+
+async function api(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// One request in flight; the newest target wins.
+async function send() {
+  if (busy || !pending) return;
+  const t = pending; pending = null; busy = true;
+  try { await api('/api/move?' + new URLSearchParams(t)); status(''); }
+  catch (e) { status(e.message); }
+  busy = false; send();
+}
+
+function go(t) {
+  if (!target) return;
+  target = {
+    pan: Math.round(clamp(t.pan ?? target.pan, limits.pan)),
+    tilt: Math.round(clamp(t.tilt ?? target.tilt, limits.tilt)),
+    zoom: Math.round(clamp(t.zoom ?? target.zoom, limits.zoom) * 10) / 10,
+  };
+  lastCmd = Date.now(); pending = target; show(target); send();
+}
+
+function nudge(dx, dy, mult = 1) {
+  if (!target) return;
+  const s = step * mult / Math.max(1, target.zoom * 0.7);
+  go({ pan: target.pan + dx * s, tilt: target.tilt + dy * s });
+}
+
+// Poll the real position; adopt it once idle so moves from tracking, gestures
+// or the CLI show up.
+async function poll() {
+  try {
+    const s = await api('/api/state');
+    limits = s.limits;
+    $('zoom').min = limits.zoom[0]; $('zoom').max = limits.zoom[1];
+    if (!target || (Date.now() - lastCmd > 2500 && !busy)) {
+      target = { pan: s.pan, tilt: s.tilt, zoom: s.zoom }; show(s);
+    }
+    const cur = $('status').textContent;
+    if (s.privacy) status('Privacy mode is on');
+    else if (cur.startsWith('Privacy') || cur.startsWith('Controller')) status('');
+  } catch (e) { status('Controller unreachable'); }
+}
+poll(); setInterval(poll, 1500);
+
+/* ---------- Inputs ---------- */
+function togglePanel(force) {
+  const p = $('panel'), open = force ?? p.hidden;
+  p.hidden = !open; $('toggle').setAttribute('aria-expanded', open);
+}
+if (touch || location.hash === '#controls') togglePanel(true);
+$('toggle').addEventListener('click', () => togglePanel());
+
+function fullscreen() {
+  const el = $('stage');
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+}
+$('fs').addEventListener('click', fullscreen);
+if (!document.fullscreenEnabled) $('fs').hidden = true;
+
+document.querySelectorAll('.pad [data-d]').forEach(b => {
+  const [dx, dy] = b.dataset.d.split(',').map(Number);
+  let timer = null;
+  const stop = () => { clearInterval(timer); timer = null; b.classList.remove('held'); };
+  b.addEventListener('pointerdown', e => {
+    e.preventDefault(); b.setPointerCapture(e.pointerId);
+    b.classList.add('held'); nudge(dx, dy);
+    timer = setInterval(() => nudge(dx, dy), 220);
+  });
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => b.addEventListener(ev, stop));
+});
+
+async function center() {
+  lastCmd = Date.now();
+  try { await api('/api/center'); status(''); lastCmd = 0; } catch (e) { status(e.message); }
+}
+$('center').addEventListener('click', center);
+
+function setStep(v) {
+  step = v;
+  document.querySelectorAll('#step button').forEach(x => x.setAttribute('aria-pressed', +x.dataset.v === v));
+}
+document.querySelectorAll('#step button').forEach(b => b.addEventListener('click', () => setStep(+b.dataset.v)));
+
+$('zoom').addEventListener('input', e => go({ zoom: +e.target.value }));
+$('zin').addEventListener('click', () => target && go({ zoom: target.zoom + 0.5 }));
+$('zout').addEventListener('click', () => target && go({ zoom: target.zoom - 0.5 }));
+
+// Click/tap on the picture to centre that point.
+$('frame').addEventListener('click', e => {
+  if (!target || e.target.closest('button, .pill')) return;
+  const r = $('frame').getBoundingClientRect();
+  const fx = (e.clientX - r.left) / r.width * 2 - 1, fy = (e.clientY - r.top) / r.height * 2 - 1;
+  const z = target.zoom;
+  go({
+    pan: target.pan + deg(Math.atan(fx * Math.tan(rad(HFOV / 2)) / z)),
+    tilt: target.tilt - deg(Math.atan(fy * Math.tan(rad(VFOV / 2)) / z)),
+  });
+  const p = document.createElement('div');
+  p.className = 'ping';
+  p.style.left = (e.clientX - r.left) + 'px'; p.style.top = (e.clientY - r.top) + 'px';
+  $('frame').appendChild(p); setTimeout(() => p.remove(), 700);
+});
+
+// Mouse wheel / trackpad zoom over the picture.
+let wheelAcc = 0;
+$('frame').addEventListener('wheel', e => {
+  if (!target) return;
+  e.preventDefault();
+  wheelAcc += e.deltaY;
+  if (Math.abs(wheelAcc) >= 60) { go({ zoom: target.zoom - Math.sign(wheelAcc) * 0.2 }); wheelAcc = 0; }
+}, { passive: false });
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[e.key];
+  if (k) { e.preventDefault(); nudge(k[0], k[1], e.shiftKey ? 3 : 1); return; }
+  switch (e.key) {
+    case '+': case '=': target && go({ zoom: target.zoom + 0.5 }); break;
+    case '-': case '_': target && go({ zoom: target.zoom - 0.5 }); break;
+    case 'c': case 'C': center(); break;
+    case 'f': case 'F': fullscreen(); break;
+    case 'h': case 'H': case '?': togglePanel(); break;
+    case '1': setStep(1); break; case '2': setStep(5); break;
+    case '3': setStep(15); break; case '4': setStep(30); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+</script>
+</body>
+</html>

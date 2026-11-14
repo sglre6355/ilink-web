@@ -1,0 +1,13 @@
+[package]
+name = "ilink-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Web page to watch and steer an Insta360 Link series webcam (unofficial)"
+repository = "https://github.com/sglre6355/ilink-web"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+insta360-link = { version = "0.1.0", git = "https://github.com/sglre6355/insta360-link" }
