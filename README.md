@@ -11,54 +11,57 @@ command-line tool uses, so both can be used at once.
 This is an unofficial project and is not affiliated with Insta360. Only the
 Link 2 (firmware 3.2.7) has been tested.
 
-## How it fits together
-
-`ilink-web` does not stream video itself. The picture comes from any program
-that serves the camera as MJPEG over HTTP, such as
-[ustreamer](https://github.com/pikvm/ustreamer), and the page reads it from
-there:
+## Running it
 
 ```sh
-ustreamer --device /dev/video0 --format MJPEG --resolution 1920x1080 \
-  --desired-fps 15 --host 0.0.0.0 --port 8080 --allow-origin '*'
 ilink-web --listen 0.0.0.0:8081
 ```
 
-Then open `http://HOST:8081/`. The page fetches the stream from port 8080 on
-the same host; `--stream` points it elsewhere. The stream server must send
-`Access-Control-Allow-Origin` (ustreamer's `--allow-origin`), because the page
-reads the stream with `fetch` so that it can reconnect.
+Then open `http://HOST:8081/`. Video and controls come from the same server;
+no other program is needed.
 
-Gimbal and zoom moves work whether or not anything is streaming.
+`ilink-web` sends the camera's own MJPEG frames as they are, without decoding
+or re-encoding them. It opens the video stream when the first viewer connects
+and releases it five seconds after the last one leaves, so the camera is free
+for video calls when no one is watching. Only one program can take video from
+the camera at a time, so the page shows no picture while another program has
+it; the gimbal still moves.
 
 ### Over Tailscale
 
 To reach it from your own devices and nothing else, listen on the machine's
-Tailscale address:
+Tailscale address and open `http://MACHINE-NAME:8081/` on the tailnet:
 
 ```sh
-ip=$(tailscale ip -4)
-ustreamer --device /dev/video0 --format MJPEG --resolution 1920x1080 \
-  --desired-fps 15 --host "$ip" --port 8080 --allow-origin '*'
-ilink-web --listen "$ip:8081"
+ilink-web --listen "$(tailscale ip -4):8081"
 ```
 
-and open `http://MACHINE-NAME:8081/` on a phone or another computer on the
-tailnet.
+### Through a Cloudflare Tunnel
+
+To share it on the internet, point a tunnel at a local address:
+
+```sh
+ilink-web --listen 127.0.0.1:8081
+cloudflared tunnel run --url http://127.0.0.1:8081 NAME
+```
+
+Read the security note below first.
 
 ## Options
 
 ```
-ilink-web [-l ADDR] [-d PATH] [-s URL]
+ilink-web [-l ADDR] [-d PATH] [-r WxH] [-f N]
 ```
 
 - `-l, --listen ADDR` is where to serve the page. The default,
   `127.0.0.1:8081`, is reachable from this machine only.
 - `-d, --device PATH` selects a camera by device node. The default is the
   first Link camera found.
-- `-s, --stream URL` is the MJPEG stream to show. A value starting with `:`
-  is a port and path on the host the page was loaded from; the default is
-  `:8080/stream`.
+- `-r, --resolution WxH` is the video size to ask the camera for. The default
+  is `1920x1080`; the Link 2 also offers `1280x720`, `1280x960`, `1920x1440`
+  and `3840x2160`.
+- `-f, --fps N` is how many frames per second each viewer gets, from 1 to 60.
+  The default is 15.
 
 If the camera is missing at startup, or is unplugged later, `ilink-web` keeps
 running and opens it again on the next request.
@@ -92,10 +95,12 @@ the stream while the tab is hidden so a phone in a pocket does not use data.
 
 ## Bandwidth
 
-The Link 2 sends MJPEG frames of around 300 to 400 KB at 1080p, and ustreamer
-passes them through unchanged, so each viewer receives roughly 40 Mbit/s at
-15 fps. That is fine on a local network; on mobile data, lower
-`--desired-fps` or `--resolution`.
+The Link 2 sends MJPEG frames of around 300 to 400 KB at 1080p, and
+`ilink-web` passes them through unchanged, so each viewer receives roughly
+40 Mbit/s at 15 fps. That is fine on a local network. On mobile data, or when
+several people watch through a tunnel on one upload link, lower `--fps` or
+`--resolution`. A viewer whose connection cannot keep up gets fewer frames
+rather than a growing delay.
 
 ## Security
 
@@ -105,8 +110,14 @@ Tailscale address.
 
 ## HTTP API
 
-The page uses these, and they are usable from scripts too. Each returns the
-camera state as JSON, or `{"error": "..."}` with a non-200 status.
+The page uses these, and they are usable from scripts too.
+
+- `GET /stream` is the live video as `multipart/x-mixed-replace` MJPEG, which
+  browsers, `ffplay` and VLC can show directly.
+- `GET /snapshot` is the current picture as one JPEG.
+
+The rest return the camera state as JSON, or `{"error": "..."}` with a
+non-200 status.
 
 - `GET /api/state`
 - `GET /api/move?pan=DEG&tilt=DEG&zoom=FACTOR` moves to an absolute

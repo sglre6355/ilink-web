@@ -11,3 +11,4 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 insta360-link = { version = "0.1.0", git = "https://github.com/sglre6355/insta360-link" }
+linuxvideo = "0.3"

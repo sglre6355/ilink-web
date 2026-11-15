@@ -1,19 +1,24 @@
 //! A web page to watch and steer an Insta360 Link webcam.
 //!
-//! The page shows an MJPEG stream served by another program (such as
-//! ustreamer) and moves the gimbal through this server, which talks to the
-//! camera with the `insta360-link` library.
+//! The server streams the camera's own MJPEG video to the page and moves the
+//! gimbal with the `insta360-link` library.
+
+mod video;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::RangeInclusive;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use insta360_link::{Camera, PanTiltUpdate};
 
+use video::Video;
+
 const PAGE: &str = include_str!("index.html");
+const BOUNDARY: &str = "ilinkwebframe";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -26,10 +31,24 @@ struct Args {
     #[arg(short, long, value_name = "PATH")]
     device: Option<String>,
 
-    /// URL of the MJPEG stream. A value starting with ':' is a port and path
-    /// on the host the page was loaded from.
-    #[arg(short, long, value_name = "URL", default_value = ":8080/stream")]
-    stream: String,
+    /// Video size to ask the camera for
+    #[arg(short, long, value_name = "WxH", default_value = "1920x1080", value_parser = resolution)]
+    resolution: (u32, u32),
+
+    /// Frames per second sent to each viewer
+    #[arg(short, long, value_name = "N", default_value_t = 15,
+          value_parser = clap::value_parser!(u32).range(1..=60))]
+    fps: u32,
+}
+
+fn resolution(value: &str) -> Result<(u32, u32), String> {
+    let (w, h) = value
+        .split_once(['x', 'X'])
+        .ok_or("expected WIDTHxHEIGHT, for example 1280x720")?;
+    match (w.parse(), h.parse()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Ok((w, h)),
+        _ => Err("expected WIDTHxHEIGHT, for example 1280x720".into()),
+    }
 }
 
 /// An open camera and the ranges it accepts.
@@ -122,10 +141,10 @@ impl From<insta360_link::Error> for ApiError {
 
 struct Server {
     device: Option<String>,
-    page: String,
     /// The camera, opened on first use and again after it fails, so that
     /// unplugging and replugging it does not need a restart.
     link: Mutex<Option<Link>>,
+    video: Arc<Video>,
 }
 
 impl Server {
@@ -177,21 +196,100 @@ impl Server {
 
         let target = request.split_whitespace().nth(1).unwrap_or("/");
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        let (status, content_type, body) = match path {
-            "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", self.page.clone()),
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        match path {
+            "/" | "/index.html" => respond(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                PAGE.as_bytes(),
+            ),
+            "/stream" => self.stream_video(&mut stream),
+            "/snapshot" => {
+                let mut viewer = self.video.watch();
+                match viewer.next(Duration::from_secs(5)) {
+                    Ok(frame) => respond(&mut stream, "200 OK", "image/jpeg", &frame),
+                    Err(error) => respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "application/json",
+                        error_json(&error).as_bytes(),
+                    ),
+                }
+            }
             p if p.starts_with("/api/") => {
                 let (status, json) = self.api(p, query);
-                (status, "application/json", json)
+                respond(&mut stream, status, "application/json", json.as_bytes());
             }
-            _ => ("404 Not Found", "text/plain", "not found".to_string()),
-        };
-        let _ = write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-             Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
+            _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
+        }
     }
+
+    /// Sends frames as `multipart/x-mixed-replace` until the viewer goes away
+    /// or the camera stops sending pictures.
+    fn stream_video(&self, stream: &mut TcpStream) {
+        let mut viewer = self.video.watch();
+        let first = match viewer.next(Duration::from_secs(5)) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let body = error_json(&error);
+                respond(
+                    stream,
+                    "503 Service Unavailable",
+                    "application/json",
+                    body.as_bytes(),
+                );
+                return;
+            }
+        };
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace;boundary={BOUNDARY}\r\n\
+             Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let interval = Duration::from_secs(1) / self.video.settings().fps;
+        let mut frame = first;
+        let mut due = Instant::now();
+        loop {
+            let part = format!(
+                "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                frame.len()
+            );
+            let sent = stream
+                .write_all(part.as_bytes())
+                .and_then(|()| stream.write_all(&frame))
+                .and_then(|()| stream.write_all(b"\r\n"));
+            if sent.is_err() {
+                return;
+            }
+            // Pace each viewer to --fps however fast the camera delivers.
+            due += interval;
+            let now = Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            } else {
+                due = now;
+            }
+            frame = match viewer.next(Duration::from_secs(5)) {
+                Ok(frame) => frame,
+                // End the response; the page reconnects by itself.
+                Err(_) => return,
+            };
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body));
 }
 
 /// The value of `key` in a query string, if it is a finite number.
@@ -221,18 +319,16 @@ fn error_json(message: &str) -> String {
     format!(r#"{{"error":"{escaped}"}}"#)
 }
 
-fn html_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 fn main() -> ExitCode {
     let args = Args::parse();
+    let (width, height) = args.resolution;
     let server = Arc::new(Server {
-        page: PAGE.replace("{{STREAM}}", &html_attr(&args.stream)),
+        video: Video::new(video::Settings {
+            device: args.device.clone(),
+            width,
+            height,
+            fps: args.fps,
+        }),
         device: args.device,
         link: Mutex::new(None),
     });
@@ -293,8 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_url_is_escaped_into_page() {
-        assert!(PAGE.contains(r#"content="{{STREAM}}""#));
-        assert_eq!(html_attr(r#"a"<b>&"#), "a&quot;&lt;b&gt;&amp;");
+    fn resolution_parses_width_and_height() {
+        assert_eq!(resolution("1920x1080"), Ok((1920, 1080)));
+        assert_eq!(resolution("1280X720"), Ok((1280, 720)));
+        assert!(resolution("1280").is_err());
+        assert!(resolution("0x720").is_err());
+        assert!(resolution("axb").is_err());
     }
 }

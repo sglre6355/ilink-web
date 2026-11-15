@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-<meta name="stream" content="{{STREAM}}">
 <title>Link Camera</title>
 <style>
   :root {
@@ -137,11 +136,7 @@ const $ = id => document.getElementById(id);
 const touch = matchMedia('(hover: none)').matches;
 
 /* ---------- Video: read the MJPEG stream ourselves so we can reconnect ---------- */
-// Set by the server (--stream); ":PORT/path" means that port on this host.
-const streamSetting = document.querySelector('meta[name=stream]').content;
-const STREAM = streamSetting.startsWith(':')
-  ? `${location.protocol}//${location.hostname}${streamSetting}`
-  : streamSetting;
+const STREAM = '/stream';
 const img = $('video');
 let streamCtl = null, lastFrame = 0, imgUrl = null;
 const CRLF2 = [13, 10, 13, 10];
