@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # FFmpeg and libclang for the `vaapi` feature.
+      # FFmpeg and libclang for the `gpu` feature.
       - run: sudo apt-get update && sudo apt-get install -y libavcodec-dev libavutil-dev libclang-dev pkg-config
       - run: cargo fmt --check
       - run: cargo clippy --all-targets

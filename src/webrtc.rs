@@ -497,9 +497,7 @@ impl EncoderThread {
                 }
                 Err(error) => {
                     eprintln!("ilink-web: webrtc: {} failed: {error}", enc.name());
-                    if enc.name() == "VA-API" {
-                        encode::hardware_failed();
-                    }
+                    encode::encoder_failed(enc.name());
                     encoder = None;
                 }
             }

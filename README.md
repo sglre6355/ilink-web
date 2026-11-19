@@ -24,8 +24,9 @@ The video reaches the page over WebRTC, on the same port number over UDP, so
 that it stays close to live even on slow or distant connections. `ilink-web`
 encodes it as H.264 at the bitrate each viewer's connection can carry,
 measured continuously, and sends gimbal commands over the same connection.
-Encoding uses the GPU through VA-API when it is available and the OpenH264
-software encoder otherwise. A page opened at `127.0.0.1` or `localhost` gets
+Encoding uses the GPU when it can, through Vulkan Video (AMD, Intel and NVIDIA
+GPUs whose drivers support it) or else VA-API, and the OpenH264 software
+encoder otherwise. A page opened at `127.0.0.1` or `localhost` gets
 the plain MJPEG stream instead, since browsers do not use WebRTC over the
 loopback interface and locally it adds no delay.
 
@@ -128,10 +129,20 @@ Options after the image name go to `ilink-web`, and the Cloudflare TURN
 variables pass in with `-e CLOUDFLARE_TURN_KEY_ID -e
 CLOUDFLARE_TURN_KEY_API_TOKEN`.
 
-The image carries no GPU drivers, so it encodes with OpenH264 unless it can
-use the host's VA-API. On the CPU, 1080p falls a little short of 30 fps;
-`-r 1280x720` keeps up. On NixOS, an image built on the same machine can
-borrow the host's drivers:
+The image carries no GPU drivers. It encodes on the GPU when the host's
+drivers are passed in, and with OpenH264 on the CPU otherwise, where 1080p
+may fall short of 30 fps on a slower machine; `-r 1280x720` keeps up.
+
+On a machine with an NVIDIA GPU, the NVIDIA Container Toolkit passes in the
+driver, and the video goes through Vulkan Video:
+
+```sh
+  --device nvidia.com/gpu=all    # Podman, after `nvidia-ctk cdi generate`
+  --gpus all                     # Docker
+```
+
+On NixOS, with any GPU, an image built on the same machine can borrow the
+host's drivers:
 
 ```sh
   --device /dev/dri -v /run/opengl-driver:/run/opengl-driver:ro -v /nix/store:/nix/store:ro
@@ -267,7 +278,7 @@ waiting their turn, only the newest is carried out.
 
 ## Building
 
-Cargo fetches the library from GitHub. The VA-API encoder needs FFmpeg's
+Cargo fetches the library from GitHub. The GPU encoders need FFmpeg's
 development files and libclang (on Debian and Ubuntu, `libavcodec-dev`,
 `libavutil-dev`, `libclang-dev` and `pkg-config`):
 
@@ -282,7 +293,9 @@ To build without FFmpeg, and encode with OpenH264 only, use
 `cargo build --release --no-default-features`.
 
 Your user needs read and write access to the camera's `/dev/video*` node,
-and to `/dev/dri/renderD*` for the GPU encoder.
+and to `/dev/dri/renderD*` (or the NVIDIA devices) for the GPU encoder. The
+Vulkan encoder needs FFmpeg 7.1 or later at run time; with an older one,
+VA-API or OpenH264 takes over.
 
 ## License
 

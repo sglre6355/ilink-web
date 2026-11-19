@@ -4,10 +4,10 @@
 //! MJPEG over HTTP) and moves the gimbal with the `insta360-link` library.
 
 mod encode;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod stun;
 mod turn;
-#[cfg(feature = "vaapi")]
-mod vaapi;
 mod video;
 mod webrtc;
 

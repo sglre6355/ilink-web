@@ -2,9 +2,10 @@
 //!
 //! The camera can send H.264 itself, but at a fixed 30 to 40 Mbit/s that no
 //! remote connection keeps up with, so frames are decoded and encoded again at
-//! the rate the connection can take. VA-API (the GPU) is used when it works,
-//! and the OpenH264 software encoder otherwise.
+//! the rate the connection can take, on the GPU (Vulkan Video or VA-API)
+//! when one works and with the OpenH264 software encoder otherwise.
 
+#[cfg(feature = "gpu")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -108,28 +109,44 @@ pub trait Encoder: Send {
     fn set_bitrate(&mut self, bps: u32);
 }
 
-/// Set once VA-API has failed while encoding, so later viewers go straight
-/// to software.
-static HARDWARE_FAILED: AtomicBool = AtomicBool::new(false);
+/// The GPU interfaces to try, best first, each with a flag that is set once
+/// it has failed so that later viewers skip it.
+#[cfg(feature = "gpu")]
+static GPU_APIS: [(crate::gpu::Api, AtomicBool); 2] = [
+    (crate::gpu::Api::Vulkan, AtomicBool::new(false)),
+    (crate::gpu::Api::Vaapi, AtomicBool::new(false)),
+];
 
-/// Opens the best available encoder for pictures of the given size.
+/// Opens the best available encoder for pictures of the given size: Vulkan
+/// Video, then VA-API, then OpenH264 on the CPU.
 pub fn open(width: usize, height: usize, fps: u32, bps: u32) -> Result<Box<dyn Encoder>, String> {
-    #[cfg(feature = "vaapi")]
-    if !HARDWARE_FAILED.load(Ordering::Relaxed) {
-        match crate::vaapi::Vaapi::new(width, height, fps, bps) {
+    #[cfg(feature = "gpu")]
+    for (api, failed) in &GPU_APIS {
+        if failed.load(Ordering::Relaxed) {
+            continue;
+        }
+        match crate::gpu::Gpu::new(*api, width, height, fps, bps) {
             Ok(encoder) => return Ok(Box::new(encoder)),
             Err(error) => {
-                eprintln!("ilink-web: VA-API unavailable ({error}), encoding with OpenH264");
-                HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                eprintln!("ilink-web: {} unavailable: {error}", api.name());
+                failed.store(true, Ordering::Relaxed);
             }
         }
     }
     Ok(Box::new(OpenH264::new(width, height, fps, bps)?))
 }
 
-/// Records that the hardware encoder failed mid-stream.
-pub fn hardware_failed() {
-    HARDWARE_FAILED.store(true, Ordering::Relaxed);
+/// Records that the encoder with this name failed mid-stream, so that it is
+/// not tried again.
+pub fn encoder_failed(name: &str) {
+    #[cfg(feature = "gpu")]
+    for (api, failed) in &GPU_APIS {
+        if api.name() == name {
+            failed.store(true, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = name;
 }
 
 pub struct OpenH264 {

@@ -36,14 +36,15 @@
           pkgs.pkg-config
           pkgs.rustPlatform.bindgenHook
         ];
-        # FFmpeg for the VA-API encoder, reduced to what it uses: libavcodec
-        # and libavutil with VA-API, and none of the codec libraries. Its own
-        # tests assume a full build, so they are skipped.
+        # FFmpeg for the GPU encoders, reduced to what they use: libavcodec and
+        # libavutil with Vulkan and VA-API, and none of the codec libraries.
+        # Its own tests assume a full build, so they are skipped.
         ffmpeg =
           (pkgs.ffmpeg-headless.override {
             withHeadlessDeps = false;
             buildAvcodec = true;
             buildAvutil = true;
+            withVulkan = true;
             withVaapi = true;
             withDrm = true;
           }).overrideAttrs
@@ -86,12 +87,20 @@
 
           # Built from nothing: the image holds ilink-web and the Nix store
           # paths it needs, with no distribution, shell or package manager.
-          # It carries no GPU drivers: VA-API is used when the host's drivers
-          # are mounted in, and OpenH264 otherwise.
+          # It carries no GPU drivers but uses the host's when they are passed
+          # in (NVIDIA's by the NVIDIA Container Toolkit), and OpenH264
+          # otherwise.
           #   nix build .#image && docker load < result
           image = pkgs.dockerTools.buildLayeredImage {
             name = "ilink-web";
             tag = "latest";
+            # Libraries NVIDIA's Vulkan driver needs but the toolkit does not
+            # bring, in /lib where the driver looks for them.
+            contents = [
+              pkgs.libglvnd
+              pkgs.libx11
+              pkgs.libxext
+            ];
             config = {
               # tini runs as PID 1 and passes on SIGTERM, which ilink-web would
               # ignore in that place, so that `docker stop` ends it at once.
@@ -100,8 +109,19 @@
                 "--"
                 (lib.getExe ilink-web)
               ];
-              # There is no home directory for Mesa's shader cache to go in.
-              Env = [ "MESA_SHADER_CACHE_DISABLE=true" ];
+              Env = [
+                # Ask the NVIDIA Container Toolkit for the Vulkan driver and
+                # the video engines, not only CUDA.
+                "NVIDIA_DRIVER_CAPABILITIES=all"
+                # Where the toolkit puts NVIDIA's libraries, which its Vulkan
+                # driver entry names without a path; Nix's loader does not
+                # read /etc/ld.so.cache, so they have to be listed.
+                "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib64:/lib"
+                # Where the toolkit puts the driver entry itself.
+                "XDG_DATA_DIRS=/usr/local/share:/usr/share"
+                # There is no home directory for Mesa's shader cache to go in.
+                "MESA_SHADER_CACHE_DISABLE=true"
+              ];
               ExposedPorts = {
                 "8081/tcp" = { };
                 "8081/udp" = { };

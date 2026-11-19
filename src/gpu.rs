@@ -1,6 +1,9 @@
-//! H.264 encoding on the GPU through FFmpeg's `h264_vaapi` encoder.
+//! H.264 encoding on the GPU through FFmpeg, with Vulkan Video or VA-API.
 //!
-//! FFmpeg's VA-API encoder cannot change its bitrate once open, so a new
+//! Vulkan Video works the same way on AMD, Intel and NVIDIA GPUs whose
+//! drivers support encoding; VA-API covers AMD and Intel ones that do not.
+//!
+//! FFmpeg's hardware encoders cannot change their bitrate once open, so a new
 //! encoder is opened when the target moves far enough; it starts with a
 //! keyframe, which costs one larger picture.
 
@@ -23,7 +26,76 @@ const REOPEN_CHANGE: f64 = 0.25;
 const REOPEN_DOWN_AFTER: Duration = Duration::from_secs(1);
 const REOPEN_UP_AFTER: Duration = Duration::from_secs(4);
 
-pub struct Vaapi {
+/// An encoder option: name and value.
+type Opt = (&'static CStr, &'static CStr);
+
+/// The GPU interface to encode through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    Vulkan,
+    Vaapi,
+}
+
+impl Api {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vulkan => "Vulkan",
+            Self::Vaapi => "VA-API",
+        }
+    }
+
+    fn device_type(self) -> ff::AVHWDeviceType {
+        match self {
+            Self::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+            Self::Vaapi => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+        }
+    }
+
+    fn pixel_format(self) -> ff::AVPixelFormat {
+        match self {
+            Self::Vulkan => ff::AVPixelFormat::AV_PIX_FMT_VULKAN,
+            Self::Vaapi => ff::AVPixelFormat::AV_PIX_FMT_VAAPI,
+        }
+    }
+
+    fn encoder(self) -> &'static CStr {
+        match self {
+            Self::Vulkan => c"h264_vulkan",
+            Self::Vaapi => c"h264_vaapi",
+        }
+    }
+
+    /// Encoder options for low delay: hand each picture back as soon as it
+    /// is done rather than keeping one in flight, and leave out SEI and the
+    /// other optional units. The Vulkan hints ask drivers to tune for live
+    /// camera video.
+    fn options(self) -> &'static [Opt] {
+        match self {
+            Self::Vulkan => &[
+                (c"async_depth", c"1"),
+                (c"units", c"0"),
+                (c"tune", c"ull"),
+                (c"usage", c"conference"),
+                (c"content", c"camera"),
+            ],
+            Self::Vaapi => &[(c"async_depth", c"1"), (c"sei", c"0")],
+        }
+    }
+
+    /// The option for constant bitrate, which keeps keyframes within the
+    /// rate-control buffer. Vulkan drivers otherwise tend to pick a variable
+    /// rate and make keyframes several times larger; VA-API picks constant
+    /// bitrate by itself when the bitrate and maximum are equal.
+    fn constant_bitrate(self) -> Option<Opt> {
+        match self {
+            Self::Vulkan => Some((c"rc_mode", c"cbr")),
+            Self::Vaapi => None,
+        }
+    }
+}
+
+pub struct Gpu {
+    api: Api,
     device: *mut ff::AVBufferRef,
     frames: *mut ff::AVBufferRef,
     codec: *mut ff::AVCodecContext,
@@ -39,7 +111,7 @@ pub struct Vaapi {
 
 // SAFETY: the FFmpeg objects are owned by this value alone and are only used
 // through `&mut self`, so moving it to another thread is fine.
-unsafe impl Send for Vaapi {}
+unsafe impl Send for Gpu {}
 
 fn check(ret: c_int, what: &str) -> Result<c_int, String> {
     if ret >= 0 {
@@ -54,14 +126,15 @@ fn check(ret: c_int, what: &str) -> Result<c_int, String> {
     Err(format!("{what}: {message}"))
 }
 
-impl Vaapi {
-    pub fn new(width: usize, height: usize, fps: u32, bps: u32) -> Result<Self, String> {
+impl Gpu {
+    pub fn new(api: Api, width: usize, height: usize, fps: u32, bps: u32) -> Result<Self, String> {
         static QUIET: Once = Once::new();
         // SAFETY: plain FFI calls; every pointer is checked before use and
         // freed by `Drop` if a later step fails.
         unsafe {
             QUIET.call_once(|| ff::av_log_set_level(ff::AV_LOG_ERROR));
             let mut this = Self {
+                api,
                 device: null_mut(),
                 frames: null_mut(),
                 codec: null_mut(),
@@ -77,12 +150,12 @@ impl Vaapi {
             check(
                 ff::av_hwdevice_ctx_create(
                     &mut this.device,
-                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                    api.device_type(),
                     null(),
                     null_mut(),
                     0,
                 ),
-                "opening the VA-API device",
+                "opening the device",
             )?;
 
             this.frames = ff::av_hwframe_ctx_alloc(this.device);
@@ -90,7 +163,7 @@ impl Vaapi {
                 return Err("allocating GPU frames".into());
             }
             let frames = (*this.frames).data.cast::<ff::AVHWFramesContext>();
-            (*frames).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*frames).format = api.pixel_format();
             (*frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
             (*frames).width = c_int::try_from(width).map_err(|e| e.to_string())?;
             (*frames).height = c_int::try_from(height).map_err(|e| e.to_string())?;
@@ -118,14 +191,28 @@ impl Vaapi {
         }
     }
 
-    /// Opens (or reopens) the encoder at `self.bps`.
+    /// Opens (or reopens) the encoder at `self.bps`, in constant bitrate
+    /// mode if the driver offers it and in its own choice of mode otherwise.
     unsafe fn open_codec(&mut self) -> Result<(), String> {
+        // SAFETY: as for `open_codec_with`.
+        unsafe {
+            match self.api.constant_bitrate() {
+                Some(cbr) => self
+                    .open_codec_with(Some(cbr))
+                    .or_else(|_| self.open_codec_with(None)),
+                None => self.open_codec_with(None),
+            }
+        }
+    }
+
+    unsafe fn open_codec_with(&mut self, rate_control: Option<Opt>) -> Result<(), String> {
         // SAFETY: called with a valid device and frames context.
         unsafe {
             ff::avcodec_free_context(&mut self.codec);
-            let encoder = ff::avcodec_find_encoder_by_name(c"h264_vaapi".as_ptr());
+            let name = self.api.encoder();
+            let encoder = ff::avcodec_find_encoder_by_name(name.as_ptr());
             if encoder.is_null() {
-                return Err("FFmpeg has no h264_vaapi encoder".into());
+                return Err(format!("FFmpeg has no {} encoder", name.to_string_lossy()));
             }
             self.codec = ff::avcodec_alloc_context3(encoder);
             if self.codec.is_null() {
@@ -139,7 +226,7 @@ impl Vaapi {
                 num: self.fps as c_int,
                 den: 1,
             };
-            c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            c.pix_fmt = self.api.pixel_format();
             c.profile = CONSTRAINED_BASELINE;
             c.max_b_frames = 0;
             c.gop_size = (self.fps * KEYFRAME_INTERVAL) as c_int;
@@ -153,13 +240,12 @@ impl Vaapi {
             c.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_SMPTE170M;
             c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE170M;
             c.hw_frames_ctx = ff::av_buffer_ref(self.frames);
-            // Hand each picture back as soon as it is encoded rather than
-            // keeping one in flight, and leave out the SEI messages.
-            ff::av_opt_set(c.priv_data, c"async_depth".as_ptr(), c"1".as_ptr(), 0);
-            ff::av_opt_set(c.priv_data, c"sei".as_ptr(), c"0".as_ptr(), 0);
+            for (key, value) in self.api.options().iter().chain(&rate_control) {
+                ff::av_opt_set(c.priv_data, key.as_ptr(), value.as_ptr(), 0);
+            }
             check(
                 ff::avcodec_open2(self.codec, encoder, null_mut()),
-                "opening h264_vaapi",
+                "opening the encoder",
             )?;
             self.opened = Instant::now();
             Ok(())
@@ -215,9 +301,9 @@ impl Vaapi {
     }
 }
 
-impl Encoder for Vaapi {
+impl Encoder for Gpu {
     fn name(&self) -> &'static str {
-        "VA-API"
+        self.api.name()
     }
 
     fn size(&self) -> (usize, usize) {
@@ -281,7 +367,7 @@ impl Encoder for Vaapi {
     }
 }
 
-impl Drop for Vaapi {
+impl Drop for Gpu {
     fn drop(&mut self) {
         // SAFETY: each free function accepts null and nulls the pointer.
         unsafe {

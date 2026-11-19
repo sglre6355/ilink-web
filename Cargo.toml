@@ -20,6 +20,6 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 ffmpeg-sys-next = { version = "9.1", default-features = false, features = ["avcodec"], optional = true }
 
 [features]
-default = ["vaapi"]
-# Encode with the GPU through FFmpeg's VA-API encoder when it is available.
-vaapi = ["dep:ffmpeg-sys-next"]
+default = ["gpu"]
+# Encode on the GPU through FFmpeg, with Vulkan Video or VA-API, when one works.
+gpu = ["dep:ffmpeg-sys-next"]
