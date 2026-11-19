@@ -2,13 +2,24 @@
 name = "ilink-web"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 description = "Web page to watch and steer an Insta360 Link series webcam (unofficial)"
 repository = "https://github.com/sglre6355/ilink-web"
 readme = "README.md"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 insta360-link = { version = "0.1.0", git = "https://github.com/sglre6355/insta360-link" }
 linuxvideo = "0.3"
+str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
+openh264 = "0.9"
+openh264-sys2 = "0.9"
+zune-jpeg = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+ffmpeg-sys-next = { version = "9.1", default-features = false, features = ["avcodec"], optional = true }
+
+[features]
+default = ["vaapi"]
+# Encode with the GPU through FFmpeg's VA-API encoder when it is available.
+vaapi = ["dep:ffmpeg-sys-next"]

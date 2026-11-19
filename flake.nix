@@ -24,7 +24,11 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rust-bin.stable.latest.default
+            pkg-config
+            rustPlatform.bindgenHook
           ];
+          # For the `vaapi` feature: FFmpeg's libraries and headers.
+          buildInputs = [ pkgs.ffmpeg ];
         };
       }
     );

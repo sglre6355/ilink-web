@@ -28,8 +28,9 @@
   }
   .frame { position: relative; aspect-ratio: 16 / 9; width: min(100cqw, 100cqh * 16 / 9);
     cursor: crosshair; touch-action: manipulation; }
-  .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+  .frame video, .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
     display: block; user-select: none; -webkit-user-drag: none; }
+  .frame [hidden] { display: none; }
   .cross { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px;
     margin: -11px 0 0 -11px; pointer-events: none; opacity: .45; }
   .cross::before, .cross::after { content: ""; position: absolute; background: #fff; }
@@ -90,7 +91,8 @@
 <body>
 <div class="stage" id="stage">
   <div class="frame" id="frame">
-    <img id="video" alt="Live camera view">
+    <video id="video" autoplay playsinline muted disablepictureinpicture aria-label="Live camera view"></video>
+    <img id="mjpeg" alt="Live camera view" hidden>
     <div class="msg" id="msg">Connecting…</div>
     <div class="cross"></div>
   <div class="hud">
@@ -135,35 +137,30 @@
 const $ = id => document.getElementById(id);
 const touch = matchMedia('(hover: none)').matches;
 
-/* ---------- Video: read the MJPEG stream ourselves so we can reconnect ---------- */
-const STREAM = '/stream';
-const img = $('video');
-let streamCtl = null, lastFrame = 0, imgUrl = null;
-const CRLF2 = [13, 10, 13, 10];
-const dec = new TextDecoder();
+/* ---------- Video: WebRTC, reconnecting by itself ---------- */
+const video = $('video');
+let pc = null, dc = null, lastFrame = 0, connectedAt = 0, retry = null;
 
-function find(buf, seq, from = 0) {
-  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+// Browsers leave loopback addresses out of WebRTC, so on this machine
+// (127.0.0.1 or localhost) the page reads the MJPEG stream instead, which
+// adds no delay locally.
+const LOCAL = /^(localhost|127(\.\d+){3}|\[::1\])$/.test(location.hostname);
+const img = $('mjpeg');
+let mjpeg = null, imgUrl = null;
+if (LOCAL) { video.hidden = true; img.hidden = false; }
+
+function find(buf, seq) {
+  outer: for (let i = 0; i <= buf.length - seq.length; i++) {
     for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
     return i;
   }
   return -1;
 }
 
-function showFrame(bytes) {
-  const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
-  const old = imgUrl;
-  img.src = imgUrl = url;
-  if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
-  lastFrame = Date.now();
-}
-
-async function startStream() {
-  stopStream();
-  const ctl = new AbortController();
-  streamCtl = ctl;
+async function readMjpeg(ctl) {
+  const CRLF2 = [13, 10, 13, 10], dec = new TextDecoder();
   try {
-    const res = await fetch(STREAM + '?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store' });
+    const res = await fetch('/stream?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store' });
     if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
     const reader = res.body.getReader();
     let buf = new Uint8Array(0);
@@ -179,34 +176,95 @@ async function startStream() {
         if (!m) { buf = buf.slice(h + 4); continue; }
         const n = +m[1], start = h + 4;
         if (buf.length < start + n) break;
-        showFrame(buf.slice(start, start + n));
+        const old = imgUrl;
+        img.src = imgUrl = URL.createObjectURL(new Blob([buf.slice(start, start + n)], { type: 'image/jpeg' }));
+        if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
+        lastFrame = Date.now();
         buf = buf.slice(start + n);
       }
     }
   } catch (e) { /* aborted or dropped: fall through to reconnect */ }
-  if (streamCtl === ctl && !document.hidden) setTimeout(startStream, 1000);
+  if (mjpeg === ctl) later();
 }
 
-function stopStream() {
-  if (streamCtl) { const c = streamCtl; streamCtl = null; c.abort(); }
+function noteFrames() {
+  if (video.requestVideoFrameCallback) {
+    const tick = () => { lastFrame = Date.now(); video.requestVideoFrameCallback(tick); };
+    video.requestVideoFrameCallback(tick);
+  } else {
+    let t = -1;
+    setInterval(() => { if (video.currentTime !== t) { t = video.currentTime; lastFrame = Date.now(); } }, 250);
+  }
+}
+noteFrames();
+
+// Resolves once the browser has gathered its candidates (or after a while),
+// since they all go in the one offer.
+function gathered(p, ms) {
+  if (p.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(done => {
+    const t = setTimeout(done, ms);
+    p.addEventListener('icegatheringstatechange', () => {
+      if (p.iceGatheringState === 'complete') { clearTimeout(t); done(); }
+    });
+  });
 }
 
-// Watchdog: reconnect if frames stop; pause while the tab is hidden (saves phone data).
+async function connect() {
+  disconnect();
+  connectedAt = Date.now();
+  if (LOCAL) { mjpeg = new AbortController(); readMjpeg(mjpeg); return; }
+  const cfg = await fetch('/webrtc', { cache: 'no-store' }).then(r => r.json()).catch(() => ({}));
+  // Browsers block port 53, so a TURN server there would only hold up the offer.
+  for (const s of cfg.iceServers || []) {
+    if (Array.isArray(s.urls)) s.urls = s.urls.filter(u => !/:53([?/]|$)/.test(u));
+  }
+  const p = new RTCPeerConnection(cfg);
+  pc = p;
+  p.addTransceiver('video', { direction: 'recvonly' });
+  p.ontrack = e => {
+    // Ask for the smallest jitter buffer: show each frame as soon as it is in.
+    if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+    if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0;
+    video.srcObject = new MediaStream([e.track]);
+  };
+  p.onconnectionstatechange = () => {
+    if (pc === p && (p.connectionState === 'failed' || p.connectionState === 'closed')) later();
+  };
+  const ch = p.createDataChannel('control');
+  ch.onopen = () => { if (pc === p) dc = ch; };
+  ch.onclose = () => { if (dc === ch) dc = null; };
+  ch.onmessage = e => { try { onState(JSON.parse(e.data)); } catch (_) {} };
+  try {
+    await p.setLocalDescription(await p.createOffer());
+    await gathered(p, 3000);
+    const res = await fetch('/webrtc', {
+      method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: p.localDescription.sdp,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (pc === p) await p.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+  } catch (e) { if (pc === p) later(); }
+}
+
+function disconnect() {
+  clearTimeout(retry); retry = null;
+  if (pc) { const p = pc; pc = null; dc = null; p.close(); }
+  if (mjpeg) { const c = mjpeg; mjpeg = null; c.abort(); }
+}
+
+function later() { disconnect(); if (!document.hidden) retry = setTimeout(connect, 1000); }
+
+// Watchdog: reconnect if frames stop; disconnect while the tab is hidden (saves phone data).
 setInterval(() => {
   const live = Date.now() - lastFrame < 3000;
   $('dot').classList.toggle('live', live);
   $('msg').textContent = live ? '' : (lastFrame ? 'Reconnecting…' : 'Connecting…');
-  if (!document.hidden && streamCtl && Date.now() - lastFrame > 6000 && Date.now() - streamStarted > 6000) {
-    streamStarted = Date.now(); startStream();
-  }
+  if (!document.hidden && (pc || mjpeg) && Date.now() - lastFrame > 8000 && Date.now() - connectedAt > 8000) connect();
 }, 1000);
-let streamStarted = Date.now();
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) stopStream(); else { streamStarted = Date.now(); startStream(); }
-});
-window.addEventListener('pageshow', () => { if (!streamCtl) startStream(); });
-window.addEventListener('online', () => startStream());
-startStream();
+document.addEventListener('visibilitychange', () => { if (document.hidden) disconnect(); else connect(); });
+window.addEventListener('pageshow', () => { if (!pc && !mjpeg) connect(); });
+window.addEventListener('online', () => connect());
+connect();
 
 /* ---------- Gimbal control ---------- */
 // Approximate Link 2 field of view at zoom 1 (79.5° diagonal, 16:9).
@@ -229,11 +287,21 @@ async function api(path) {
   return j;
 }
 
-// One request in flight; the newest target wins.
+// Commands go over the WebRTC data channel when it is open: no new
+// connection per command, and the server keeps only the newest of a run of
+// moves. Its replies, and the state it pushes while idle, arrive in onState.
+// Without the channel they fall back to HTTP, one request in flight.
+function command(path) {
+  if (dc && dc.readyState === 'open') { dc.send(path); return true; }
+  return false;
+}
+
 async function send() {
   if (busy || !pending) return;
-  const t = pending; pending = null; busy = true;
-  try { await api('/api/move?' + new URLSearchParams(t)); status(''); }
+  const path = '/api/move?' + new URLSearchParams(pending); pending = null;
+  if (command(path)) return;
+  busy = true;
+  try { await api(path); status(''); }
   catch (e) { status(e.message); }
   busy = false; send();
 }
@@ -254,20 +322,24 @@ function nudge(dx, dy, mult = 1) {
   go({ pan: target.pan + dx * s, tilt: target.tilt + dy * s });
 }
 
-// Poll the real position; adopt it once idle so moves from tracking, gestures
-// or the CLI show up.
+// Adopt the real position once idle, so moves from tracking, gestures or the
+// CLI show up.
+function onState(s) {
+  if (s.error) { status(s.error); return; }
+  limits = s.limits;
+  $('zoom').min = limits.zoom[0]; $('zoom').max = limits.zoom[1];
+  if (!target || (Date.now() - lastCmd > 2500 && !busy)) {
+    target = { pan: s.pan, tilt: s.tilt, zoom: s.zoom }; show(s);
+  }
+  const cur = $('status').textContent;
+  if (s.privacy) status('Privacy mode is on');
+  else if (cur) status('');
+}
+
+// Poll over HTTP only while the data channel is down.
 async function poll() {
-  try {
-    const s = await api('/api/state');
-    limits = s.limits;
-    $('zoom').min = limits.zoom[0]; $('zoom').max = limits.zoom[1];
-    if (!target || (Date.now() - lastCmd > 2500 && !busy)) {
-      target = { pan: s.pan, tilt: s.tilt, zoom: s.zoom }; show(s);
-    }
-    const cur = $('status').textContent;
-    if (s.privacy) status('Privacy mode is on');
-    else if (cur.startsWith('Privacy') || cur.startsWith('Controller')) status('');
-  } catch (e) { status('Controller unreachable'); }
+  if (dc) return;
+  try { onState(await api('/api/state')); } catch (e) { status('Controller unreachable'); }
 }
 poll(); setInterval(poll, 1500);
 
@@ -301,6 +373,7 @@ document.querySelectorAll('.pad [data-d]').forEach(b => {
 
 async function center() {
   lastCmd = Date.now();
+  if (command('/api/center')) { lastCmd = 0; return; }
   try { await api('/api/center'); status(''); lastCmd = 0; } catch (e) { status(e.message); }
 }
 $('center').addEventListener('click', center);
