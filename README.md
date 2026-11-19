@@ -100,6 +100,47 @@ Any other TURN server works too, with `--turn`, `--turn-user` and
 `--turn-password` in place of the Cloudflare key; the user name and password
 are then handed to every viewer as they are.
 
+### In a container
+
+The flake builds a container image of about 35 MB that holds `ilink-web`
+and the libraries it links, and nothing else: no distribution, shell or
+package manager.
+
+```sh
+nix build .#image
+podman load < result        # or: docker load < result
+```
+
+It needs the camera's device nodes, and the host's network so that WebRTC
+offers the host's own addresses. It runs as an unprivileged user, so it also
+needs permission to open the camera. With rootless Podman, `--userns keep-id`
+and `--user` run it as you:
+
+```sh
+podman run --rm --network host --userns keep-id --user "$(id -u):$(id -g)" \
+  --device /dev/video0 --device /dev/video1 \
+  localhost/ilink-web --listen 0.0.0.0:8081
+```
+
+With Docker, give it the camera's group instead, by number since the image
+has no group names: `--group-add "$(getent group video | cut -d: -f3)"`.
+Options after the image name go to `ilink-web`, and the Cloudflare TURN
+variables pass in with `-e CLOUDFLARE_TURN_KEY_ID -e
+CLOUDFLARE_TURN_KEY_API_TOKEN`.
+
+The image carries no GPU drivers, so it encodes with OpenH264 unless it can
+use the host's VA-API. On the CPU, 1080p falls a little short of 30 fps;
+`-r 1280x720` keeps up. On NixOS, an image built on the same machine can
+borrow the host's drivers:
+
+```sh
+  --device /dev/dri -v /run/opengl-driver:/run/opengl-driver:ro -v /nix/store:/nix/store:ro
+```
+
+Mounting the host's `/nix/store` over the image's works because everything
+in the image came from that same store; an image built on another machine
+would not find its files.
+
 ## Options
 
 ```
