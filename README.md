@@ -58,9 +58,10 @@ browser sends the video through it, and `ilink-web` learns its own public
 address from a STUN server so that the video can come in through the router.
 
 `--ice-servers-command` gives the page its TURN servers. It runs a shell
-command each time a page connects and passes on what it prints, an
-`{"iceServers": [...]}` object as `RTCPeerConnection` takes it. A TURN
-service's short-lived credentials can be fetched that way, and a fixed list
+command and passes on what it prints, an `{"iceServers": [...]}` object as
+`RTCPeerConnection` takes it, to every page that connects for the next hour,
+then runs it again. A TURN service's short-lived credentials can be fetched
+that way, as long as they stay valid for more than an hour, and a fixed list
 can come from `cat servers.json`. Credentials in it are handed to every
 viewer, so they should expire or belong to an account made for this.
 
@@ -198,9 +199,9 @@ ilink-web [-l ADDR] [-u ADDR] [-d PATH] [-r WxH] [-f N] [--max-bitrate KBPS]
   viewers, and the page uses it too unless `--ice-servers-command` is given.
 - `--ice-servers-command COMMAND` is a shell command that prints the page's
   `{"iceServers": [...]}` as JSON, for TURN servers; see
-  [On the internet](#on-the-internet). It runs each time a page connects, and
-  if it fails or takes over 10 seconds the page gets the `--stun` server
-  alone.
+  [On the internet](#on-the-internet). Its output is reused for an hour. If
+  it fails or takes over 10 seconds, the page gets the `--stun` server alone
+  and the command runs again for the next page.
 
 If the camera is missing at startup, or is unplugged later, `ilink-web` keeps
 running and opens it again on the next request.

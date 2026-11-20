@@ -2,10 +2,13 @@
 //!
 //! It comes from `--ice-servers-command` when one is given, so that a TURN
 //! service's short-lived credentials can be fetched by whatever means it
-//! offers, and otherwise lists the `--stun` server alone.
+//! offers, and otherwise lists the `--stun` server alone. The page asks for
+//! the list every time it reconnects, so the command's output is reused for
+//! an hour rather than fetched each time.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,11 +16,16 @@ use serde_json::{Value, json};
 
 /// How long the command may take before the page gets the fallback list.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the command's output is handed out before it is run again.
+/// Credentials in it must stay valid for longer than this.
+const REUSE: Duration = Duration::from_secs(60 * 60);
 
 pub struct IceServers {
     command: Option<String>,
     stun: Option<String>,
     timeout: Duration,
+    /// The command's last good output and when it was made.
+    cached: Mutex<Option<(Instant, String)>>,
 }
 
 impl IceServers {
@@ -26,6 +34,7 @@ impl IceServers {
             command,
             stun,
             timeout: TIMEOUT,
+            cached: Mutex::new(None),
         }
     }
 
@@ -33,8 +42,19 @@ impl IceServers {
     /// is no command or it fails, one with the STUN server.
     pub fn json(&self) -> String {
         if let Some(command) = &self.command {
+            // Held while the command runs, so that pages connecting at the
+            // same time share one run.
+            let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((made, json)) = cached.as_ref()
+                && made.elapsed() < REUSE
+            {
+                return json.clone();
+            }
             match run(command, self.timeout) {
-                Ok(json) => return json,
+                Ok(json) => {
+                    *cached = Some((Instant::now(), json.clone()));
+                    return json;
+                }
                 Err(error) => eprintln!("ilink-web: --ice-servers-command: {error}"),
             }
         }
@@ -93,13 +113,15 @@ fn run(command: &str, timeout: Duration) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn servers(command: Option<&str>, stun: Option<&str>) -> String {
+    fn ice_servers(command: Option<&str>, stun: Option<&str>) -> IceServers {
         IceServers {
-            command: command.map(String::from),
-            stun: stun.map(String::from),
             timeout: Duration::from_secs(2),
+            ..IceServers::new(command.map(String::from), stun.map(String::from))
         }
-        .json()
+    }
+
+    fn servers(command: Option<&str>, stun: Option<&str>) -> String {
+        ice_servers(command, stun).json()
     }
 
     #[test]
@@ -135,5 +157,31 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn reuses_the_output_but_not_a_failure() {
+        let dir = std::env::temp_dir().join(format!("ilink-web-ice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        let ok = dir.join("ok");
+        // Counts its runs, and succeeds only once `ok` exists.
+        let command = format!(
+            r#"echo >> '{runs}'; test -e '{ok}' && echo '{{"iceServers":[]}}'"#,
+            runs = runs.display(),
+            ok = ok.display()
+        );
+        let ice = ice_servers(Some(&command), Some("s.example.com:3478"));
+        let count = || std::fs::read_to_string(&runs).unwrap().lines().count();
+
+        assert!(ice.json().contains("s.example.com"));
+        assert!(ice.json().contains("s.example.com"));
+        assert_eq!(count(), 2, "a failure is tried again");
+
+        std::fs::write(&ok, "").unwrap();
+        assert_eq!(ice.json(), r#"{"iceServers":[]}"#);
+        assert_eq!(ice.json(), r#"{"iceServers":[]}"#);
+        assert_eq!(count(), 3, "a success is reused");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -61,7 +61,8 @@ struct Args {
     stun: Option<String>,
 
     /// Shell command printing the page's `{"iceServers": [...]}` as JSON,
-    /// run each time a page connects; for TURN servers and their credentials
+    /// for TURN servers and their credentials; its output is reused for an
+    /// hour
     #[arg(long, value_name = "COMMAND")]
     ice_servers_command: Option<String>,
 }
