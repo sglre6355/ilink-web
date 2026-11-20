@@ -36,14 +36,17 @@
           pkgs.pkg-config
           pkgs.rustPlatform.bindgenHook
         ];
-        # FFmpeg for the GPU encoders, reduced to what they use: libavcodec and
-        # libavutil with Vulkan and VA-API, and none of the codec libraries.
-        # Its own tests assume a full build, so they are skipped.
+        # FFmpeg, reduced to what the video needs: libavcodec (its own JPEG
+        # decoder, the Vulkan and VA-API encoders, and OpenH264 for the CPU),
+        # libswscale and libavutil. Its own tests assume a full build, so
+        # they are skipped.
         ffmpeg =
           (pkgs.ffmpeg-headless.override {
             withHeadlessDeps = false;
             buildAvcodec = true;
             buildAvutil = true;
+            buildSwscale = true;
+            withOpenh264 = true;
             withVulkan = true;
             withVaapi = true;
             withDrm = true;

@@ -24,9 +24,10 @@ The video reaches the page over WebRTC, on the same port number over UDP, so
 that it stays close to live even on slow or distant connections. `ilink-web`
 encodes it as H.264 at the bitrate each viewer's connection can carry,
 measured continuously, and sends gimbal commands over the same connection.
-Encoding uses the GPU when it can, through Vulkan Video (AMD, Intel and NVIDIA
-GPUs whose drivers support it) or else VA-API, and the OpenH264 software
-encoder otherwise. A page opened at `127.0.0.1` or `localhost` gets
+All of it goes through FFmpeg: encoding uses the GPU when it can, through
+Vulkan Video (AMD, Intel and NVIDIA GPUs whose drivers support it) or else
+VA-API, and the OpenH264 or x264 software encoder otherwise. A page opened at
+`127.0.0.1` or `localhost` gets
 the plain MJPEG stream instead, since browsers do not use WebRTC over the
 loopback interface and locally it adds no delay.
 
@@ -294,9 +295,11 @@ waiting their turn, only the newest is carried out.
 
 ## Building
 
-Cargo fetches the library from GitHub. The GPU encoders need FFmpeg's
-development files and libclang (on Debian and Ubuntu, `libavcodec-dev`,
-`libavutil-dev`, `libclang-dev` and `pkg-config`):
+Cargo fetches the library from GitHub. Building needs FFmpeg's development
+files and libclang (on Debian and Ubuntu, `libavcodec-dev`, `libavutil-dev`,
+`libswscale-dev`, `libclang-dev` and `pkg-config`). FFmpeg must offer an H.264
+encoder for when no GPU one works, `libopenh264` or `libx264`; `ffmpeg
+-encoders | grep 264` lists them.
 
 ```sh
 git clone https://github.com/sglre6355/ilink-web
@@ -305,13 +308,10 @@ cargo build --release        # Rust 1.89 or later; `nix develop` provides one
 ./target/release/ilink-web --help
 ```
 
-To build without FFmpeg, and encode with OpenH264 only, use
-`cargo build --release --no-default-features`.
-
 Your user needs read and write access to the camera's `/dev/video*` node,
 and to `/dev/dri/renderD*` (or the NVIDIA devices) for the GPU encoder. The
 Vulkan encoder needs FFmpeg 7.1 or later at run time; with an older one,
-VA-API or OpenH264 takes over.
+VA-API or a software encoder takes over.
 
 ## License
 

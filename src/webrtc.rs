@@ -27,7 +27,7 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use crate::camera::{Command, error_json};
-use crate::encode::{self, Encoder, Picture};
+use crate::encode::Transcoder;
 use crate::stun;
 use crate::video::Video;
 
@@ -435,8 +435,13 @@ struct EncoderThread {
 impl EncoderThread {
     fn run(self) {
         let mut viewer = self.video.watch();
-        let mut encoder: Option<Box<dyn Encoder>> = None;
-        let mut picture = Picture::default();
+        let mut transcoder = match Transcoder::new(self.fps) {
+            Ok(transcoder) => transcoder,
+            Err(error) => {
+                eprintln!("ilink-web: webrtc: {error}");
+                return;
+            }
+        };
         let start = Instant::now();
         while !self.shared.closed.load(Ordering::Relaxed) {
             // Waiting for the newest frame skips any that arrived while the
@@ -449,36 +454,9 @@ impl EncoderThread {
             if !self.shared.connected.load(Ordering::Relaxed) {
                 continue;
             }
-            if let Err(error) = encode::decode_jpeg(&jpeg, &mut picture) {
-                eprintln!("ilink-web: webrtc: {error}");
-                continue;
-            }
-            let size = (picture.width, picture.height);
             let bitrate = self.shared.bitrate.load(Ordering::Relaxed);
-            if encoder.as_ref().is_none_or(|e| e.size() != size) {
-                match encode::open(size.0, size.1, self.fps, bitrate) {
-                    Ok(opened) => {
-                        eprintln!(
-                            "ilink-web: webrtc: encoding {}x{} with {}",
-                            size.0,
-                            size.1,
-                            opened.name()
-                        );
-                        encoder = Some(opened);
-                        self.shared.keyframe.store(true, Ordering::Relaxed);
-                    }
-                    Err(error) => {
-                        eprintln!("ilink-web: webrtc: {error}");
-                        return;
-                    }
-                }
-            }
-            let Some(enc) = encoder.as_mut() else {
-                continue;
-            };
-            enc.set_bitrate(bitrate);
             let keyframe = self.shared.keyframe.swap(false, Ordering::Relaxed);
-            match enc.encode(&picture, captured - start, keyframe) {
+            match transcoder.encode(&jpeg, captured - start, bitrate, keyframe) {
                 Ok(data) if data.is_empty() => {}
                 Ok(data) => {
                     let frame = Frame {
@@ -491,9 +469,10 @@ impl EncoderThread {
                     }
                 }
                 Err(error) => {
-                    eprintln!("ilink-web: webrtc: {} failed: {error}", enc.name());
-                    encode::encoder_failed(enc.name());
-                    encoder = None;
+                    eprintln!("ilink-web: webrtc: {error}");
+                    // The next encoder starts with a keyframe anyway; ask
+                    // again in case the picture alone was at fault.
+                    self.shared.keyframe.store(true, Ordering::Relaxed);
                 }
             }
         }

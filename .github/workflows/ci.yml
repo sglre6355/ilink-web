@@ -17,9 +17,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # FFmpeg and libclang for the `gpu` feature.
-      - run: sudo apt-get update && sudo apt-get install -y libavcodec-dev libavutil-dev libclang-dev pkg-config
+      # FFmpeg (libavcodec with an H.264 encoder, and libswscale) and
+      # libclang to read its headers.
+      - run: sudo apt-get update && sudo apt-get install -y libavcodec-dev libavutil-dev libswscale-dev libclang-dev pkg-config
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
-      - run: cargo clippy --all-targets --no-default-features
       - run: cargo test

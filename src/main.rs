@@ -5,8 +5,7 @@
 
 mod camera;
 mod encode;
-#[cfg(feature = "gpu")]
-mod gpu;
+mod ffmpeg;
 mod http;
 mod ice;
 mod stun;
