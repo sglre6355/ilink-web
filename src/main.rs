@@ -3,6 +3,7 @@
 //! The server sends the camera's video to the page over WebRTC (or as plain
 //! MJPEG over HTTP) and moves the gimbal with the `insta360-link` library.
 
+mod camera;
 mod encode;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -13,14 +14,13 @@ mod webrtc;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::ops::RangeInclusive;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use insta360_link::{Camera, PanTiltUpdate};
 
+use camera::{Command, Gimbal, error_json};
 use ice::IceServers;
 use video::Video;
 use webrtc::Hub;
@@ -81,147 +81,25 @@ fn resolution(value: &str) -> Result<(u32, u32), String> {
     }
 }
 
-/// An open camera and the ranges it accepts.
-struct Link {
-    camera: Camera,
-    pan: RangeInclusive<f64>,
-    tilt: RangeInclusive<f64>,
-    zoom: RangeInclusive<f64>,
-}
-
-impl Link {
-    fn open(device: Option<&str>) -> insta360_link::Result<Self> {
-        let camera = match device {
-            Some(path) => Camera::open(path)?,
-            None => Camera::open_first()?,
-        };
-        let limits = camera.position_limits()?;
-        let zoom = camera.zoom_limits()?;
-        Ok(Self {
-            camera,
-            pan: limits.pan,
-            tilt: limits.tilt,
-            zoom,
-        })
-    }
-
-    fn state_json(&self) -> insta360_link::Result<String> {
-        let position = self.camera.position()?;
-        let zoom = self.camera.zoom()?;
-        let privacy = self.camera.privacy().unwrap_or(false);
-        Ok(format!(
-            r#"{{"pan":{},"tilt":{},"zoom":{},"privacy":{},"limits":{{"pan":[{},{}],"tilt":[{},{}],"zoom":[{},{}]}}}}"#,
-            position.pan,
-            position.tilt,
-            zoom,
-            privacy,
-            self.pan.start(),
-            self.pan.end(),
-            self.tilt.start(),
-            self.tilt.end(),
-            self.zoom.start(),
-            self.zoom.end()
-        ))
-    }
-
-    /// Handles one API call and returns the camera state as JSON.
-    fn api(&self, path: &str, query: &str) -> Result<String, ApiError> {
-        match path {
-            "/api/state" => {}
-            // Absolute (pan, tilt, zoom) and relative (dpan, dtilt, dzoom) moves.
-            "/api/move" => {
-                let get = |key| param(query, key);
-                let (pan, tilt, dpan, dtilt) = (get("pan"), get("tilt"), get("dpan"), get("dtilt"));
-                if pan.is_some() || tilt.is_some() || dpan.is_some() || dtilt.is_some() {
-                    // Skip reading the position when it is not needed: every
-                    // camera round trip delays the move.
-                    let absolute =
-                        pan.is_some() && tilt.is_some() && dpan.is_none() && dtilt.is_none();
-                    let current = if absolute {
-                        None
-                    } else {
-                        Some(self.camera.position()?)
-                    };
-                    let pan = pan.or(current.as_ref().map(|c| c.pan)).unwrap_or_default()
-                        + dpan.unwrap_or(0.0);
-                    let tilt = tilt
-                        .or(current.as_ref().map(|c| c.tilt))
-                        .unwrap_or_default()
-                        + dtilt.unwrap_or(0.0);
-                    self.camera.set_position(PanTiltUpdate {
-                        pan: Some(clamp(pan, &self.pan).round()),
-                        tilt: Some(clamp(tilt, &self.tilt).round()),
-                    })?;
-                }
-                let (zoom, dzoom) = (get("zoom"), get("dzoom"));
-                if zoom.is_some() || dzoom.is_some() {
-                    let current = self.camera.zoom()?;
-                    let zoom = zoom.unwrap_or(current) + dzoom.unwrap_or(0.0);
-                    let zoom = (clamp(zoom, &self.zoom) * 10.0).round() / 10.0;
-                    if (zoom - current).abs() > 0.05 {
-                        self.camera.set_zoom(zoom)?;
-                    }
-                }
-            }
-            "/api/center" => self.camera.recenter()?,
-            _ => return Err(ApiError::NotFound),
-        }
-        Ok(self.state_json()?)
-    }
-}
-
-enum ApiError {
-    NotFound,
-    Camera(insta360_link::Error),
-}
-
-impl From<insta360_link::Error> for ApiError {
-    fn from(error: insta360_link::Error) -> Self {
-        Self::Camera(error)
-    }
-}
-
 struct Server {
-    device: Option<String>,
-    /// The camera, opened on first use and again after it fails, so that
-    /// unplugging and replugging it does not need a restart.
-    link: Mutex<Option<Link>>,
+    gimbal: Gimbal,
     video: Arc<Video>,
     hub: Arc<Hub>,
     ice_servers: IceServers,
 }
 
 impl Server {
-    fn api(&self, path: &str, query: &str) -> (&'static str, String) {
-        let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
-        if link.is_none() {
-            match Link::open(self.device.as_deref()) {
-                Ok(opened) => *link = Some(opened),
-                Err(error) => return ("503 Service Unavailable", error_json(&error.to_string())),
-            }
+    /// Carries out a command and returns the HTTP status and the JSON reply:
+    /// the camera state, or an error.
+    fn run(&self, command: &Command) -> (&'static str, String) {
+        match self.gimbal.run(command) {
+            Ok(state) => (
+                "200 OK",
+                serde_json::to_string(&state).expect("a state always serializes"),
+            ),
+            Err(error @ camera::Error::Unavailable(_)) => ("503 Service Unavailable", error.json()),
+            Err(error) => ("500 Internal Server Error", error.json()),
         }
-        let result = link
-            .as_ref()
-            .map(|l| l.api(path, query))
-            .expect("opened above");
-        match result {
-            Ok(json) => ("200 OK", json),
-            Err(ApiError::NotFound) => ("404 Not Found", error_json("not found")),
-            Err(ApiError::Camera(error)) => {
-                // Reopen on the next request in case the camera went away.
-                if matches!(link.as_ref().map(|l| l.camera.position()), Some(Err(_))) {
-                    *link = None;
-                }
-                ("500 Internal Server Error", error_json(&error.to_string()))
-            }
-        }
-    }
-
-    /// Runs an API call given as a path with a query string and returns the
-    /// JSON reply, for commands arriving over WebRTC.
-    fn command(&self, target: &str) -> String {
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        self.api(path, query).1
     }
 
     fn handle(self: &Arc<Self>, mut stream: TcpStream) {
@@ -249,7 +127,7 @@ impl Server {
         let mut words = request.split_whitespace();
         let method = words.next().unwrap_or("GET");
         let target = words.next().unwrap_or("/");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let path = target.split_once('?').map_or(target, |(path, _)| path);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         match path {
             "/" | "/index.html" => respond(
@@ -263,7 +141,7 @@ impl Server {
                     .local_addr()
                     .map_or(IpAddr::from([127, 0, 0, 1]), |a| a.ip());
                 let server = Arc::clone(self);
-                let control: webrtc::Control = Arc::new(move |t: &str| server.command(t));
+                let control: webrtc::Control = Arc::new(move |c: &Command| server.run(c).1);
                 let offer = String::from_utf8_lossy(&body);
                 match self.hub.answer(&offer, local_ip, control) {
                     Ok(answer) => respond(
@@ -303,7 +181,10 @@ impl Server {
                 }
             }
             p if p.starts_with("/api/") => {
-                let (status, json) = self.api(p, query);
+                let (status, json) = match Command::parse(target) {
+                    Some(command) => self.run(&command),
+                    None => ("404 Not Found", error_json("not found")),
+                };
                 respond(&mut stream, status, "application/json", json.as_bytes());
             }
             _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
@@ -377,37 +258,6 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]
         .and_then(|()| stream.write_all(body));
 }
 
-/// The value of `key` in a query string, if it is a finite number.
-fn param(query: &str, key: &str) -> Option<f64> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| *k == key)
-        .and_then(|(_, v)| v.parse().ok())
-        .filter(|v: &f64| v.is_finite())
-}
-
-fn clamp(value: f64, range: &RangeInclusive<f64>) -> f64 {
-    value.clamp(*range.start(), *range.end())
-}
-
-fn json_escape(text: &str) -> String {
-    let mut escaped = String::new();
-    for c in text.chars() {
-        match c {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            c if c.is_control() => escaped.push(' '),
-            c => escaped.push(c),
-        }
-    }
-    escaped
-}
-
-fn error_json(message: &str) -> String {
-    format!(r#"{{"error":"{}"}}"#, json_escape(message))
-}
-
 fn main() -> ExitCode {
     let args = Args::parse();
     let (width, height) = args.resolution;
@@ -436,23 +286,12 @@ fn main() -> ExitCode {
         video,
         hub,
         ice_servers: IceServers::new(args.ice_servers_command, args.stun),
-        device: args.device,
-        link: Mutex::new(None),
+        gimbal: Gimbal::new(args.device),
     });
 
     // Open the camera up front so a missing camera is reported straight away.
-    match Link::open(server.device.as_deref()) {
-        Ok(link) => {
-            eprintln!(
-                "{} at {}: pan {:?}, tilt {:?}, zoom {:?}",
-                link.camera.info().model.name(),
-                link.camera.info().id,
-                link.pan,
-                link.tilt,
-                link.zoom
-            );
-            *server.link.lock().expect("not poisoned") = Some(link);
-        }
+    match server.gimbal.open() {
+        Ok(description) => eprintln!("{description}"),
         Err(error) => eprintln!("ilink-web: {error}; will retry when the page asks"),
     }
 
@@ -474,26 +313,6 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn param_reads_finite_numbers_only() {
-        let query = "pan=12.5&tilt=-3&zoom=NaN&dpan=inf&x=abc";
-        assert_eq!(param(query, "pan"), Some(12.5));
-        assert_eq!(param(query, "tilt"), Some(-3.0));
-        assert_eq!(param(query, "zoom"), None);
-        assert_eq!(param(query, "dpan"), None);
-        assert_eq!(param(query, "x"), None);
-        assert_eq!(param(query, "missing"), None);
-        assert_eq!(param("", "pan"), None);
-    }
-
-    #[test]
-    fn error_json_escapes() {
-        assert_eq!(
-            error_json("bad \"value\"\n\\"),
-            r#"{"error":"bad \"value\" \\"}"#
-        );
-    }
 
     #[test]
     fn resolution_parses_width_and_height() {

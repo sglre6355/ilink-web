@@ -26,6 +26,7 @@ use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
+use crate::camera::{Command, error_json};
 use crate::encode::{self, Encoder, Picture};
 use crate::stun;
 use crate::video::Video;
@@ -43,8 +44,8 @@ const STATE_INTERVAL: Duration = Duration::from_millis(1500);
 /// How often the public address is looked up again from the STUN server.
 const STUN_REFRESH: Duration = Duration::from_secs(60);
 
-/// Runs a gimbal command such as `/api/move?pan=10` and returns the JSON reply.
-pub type Control = Arc<dyn Fn(&str) -> String + Send + Sync>;
+/// Carries out a gimbal command and returns the JSON reply.
+pub type Control = Arc<dyn Fn(&Command) -> String + Send + Sync>;
 
 pub struct Options {
     pub video: Arc<Video>,
@@ -503,30 +504,35 @@ impl EncoderThread {
 /// the camera state, or pushes the state every so often while idle.
 fn run_commands(rx: &Receiver<String>, control: &Control, tx: &Sender<Msg>) {
     loop {
-        let batch: Vec<String> = match rx.recv_timeout(STATE_INTERVAL) {
-            Ok(first) => std::iter::once(first).chain(rx.try_iter()).collect(),
-            Err(RecvTimeoutError::Timeout) => vec!["/api/state".into()],
+        let batch: Vec<Option<Command>> = match rx.recv_timeout(STATE_INTERVAL) {
+            Ok(first) => std::iter::once(first)
+                .chain(rx.try_iter())
+                .map(|text| Command::parse(&text))
+                .collect(),
+            Err(RecvTimeoutError::Timeout) => vec![Some(Command::State)],
             Err(RecvTimeoutError::Disconnected) => return,
         };
         for (i, command) in batch.iter().enumerate() {
-            // A move to an absolute position is overtaken by the next one, so
-            // only the newest of a run of them is worth sending to the camera.
-            if is_absolute_move(command) && batch.get(i + 1).is_some_and(|c| is_absolute_move(c)) {
-                continue;
-            }
-            if tx.send(Msg::Reply(control(command))).is_err() {
+            let reply = match command {
+                // A move to an absolute position is overtaken by the next
+                // one, so only the newest of a run of them is worth sending
+                // to the camera.
+                Some(c)
+                    if c.is_absolute_move()
+                        && batch
+                            .get(i + 1)
+                            .is_some_and(|next| next.is_some_and(|n| n.is_absolute_move())) =>
+                {
+                    continue;
+                }
+                Some(c) => control(c),
+                None => error_json("unknown command"),
+            };
+            if tx.send(Msg::Reply(reply)).is_err() {
                 return;
             }
         }
     }
-}
-
-fn is_absolute_move(command: &str) -> bool {
-    command.strip_prefix("/api/move?").is_some_and(|query| {
-        query.split('&').all(|pair| {
-            !pair.starts_with("dpan=") && !pair.starts_with("dtilt=") && !pair.starts_with("dzoom=")
-        })
-    })
 }
 
 #[cfg(test)]
@@ -543,13 +549,6 @@ mod tests {
         assert!(!kept.contains(".local"));
         assert!(kept.contains("203.0.113.5"));
         assert!(kept.starts_with("v=0\r\n") && kept.ends_with("a=mid:0\r\n"));
-    }
-
-    #[test]
-    fn recognises_absolute_moves() {
-        assert!(is_absolute_move("/api/move?pan=1&tilt=2&zoom=1.5"));
-        assert!(!is_absolute_move("/api/move?dpan=1"));
-        assert!(!is_absolute_move("/api/center"));
     }
 
     #[test]

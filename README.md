@@ -280,7 +280,7 @@ non-200 status.
 
 ```console
 $ curl -s 'http://127.0.0.1:8081/api/move?dpan=10'
-{"pan":35,"tilt":-28,"zoom":1,"privacy":false,"limits":{"pan":[-145,145],"tilt":[-90,100],"zoom":[1,4]}}
+{"pan":35.0,"tilt":-28.0,"zoom":1.0,"privacy":false,"limits":{"pan":[-145.0,145.0],"tilt":[-90.0,100.0],"zoom":[1.0,4.0]}}
 ```
 
 The position in a reply is read straight after the command, so it can show

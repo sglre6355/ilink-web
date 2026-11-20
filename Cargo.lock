@@ -625,6 +625,7 @@ dependencies = [
  "linuxvideo",
  "openh264",
  "openh264-sys2",
+ "serde",
  "serde_json",
  "str0m",
  "zune-jpeg",
