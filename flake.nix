@@ -67,7 +67,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "insta360-link-0.1.0" = "sha256-0Ynnw4x1rIWsAsRhA/E/zxE5Uj1H6LvpGB2MeL7d/lY=";
+              "insta360-link-0.1.0" = "sha256-3LE2nPtizF3FzOivH+IjIst9h+BgVbt02XNUlsIFLPY=";
             };
           };
           nativeBuildInputs = buildTools;

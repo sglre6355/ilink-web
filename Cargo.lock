@@ -183,7 +183,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -642,7 +642,7 @@ dependencies = [
 [[package]]
 name = "insta360-link"
 version = "0.1.0"
-source = "git+https://github.com/sglre6355/insta360-link#824355efd3f3d27224aa0a3e70fd56f736e40f5e"
+source = "git+https://github.com/sglre6355/insta360-link#793ae28a77191f7a1a4d7e37c46a1be43fe6cb26"
 dependencies = [
  "libc",
  "thiserror",
