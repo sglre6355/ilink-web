@@ -215,10 +215,6 @@ async function connect() {
   connectedAt = Date.now();
   if (LOCAL) { mjpeg = new AbortController(); readMjpeg(mjpeg); return; }
   const cfg = await fetch('/webrtc', { cache: 'no-store' }).then(r => r.json()).catch(() => ({}));
-  // Browsers block port 53, so a TURN server there would only hold up the offer.
-  for (const s of cfg.iceServers || []) {
-    if (Array.isArray(s.urls)) s.urls = s.urls.filter(u => !/:53([?/]|$)/.test(u));
-  }
   const p = new RTCPeerConnection(cfg);
   pc = p;
   p.addTransceiver('video', { direction: 'recvonly' });

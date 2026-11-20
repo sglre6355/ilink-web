@@ -86,7 +86,8 @@
           default = ilink-web;
 
           # Built from nothing: the image holds ilink-web and the Nix store
-          # paths it needs, with no distribution, shell or package manager.
+          # paths it needs, plus sh, curl and jq for --ice-servers-command,
+          # with no distribution or package manager.
           # It carries no GPU drivers but uses the host's when they are passed
           # in (NVIDIA's by the NVIDIA Container Toolkit), and OpenH264
           # otherwise.
@@ -94,12 +95,18 @@
           image = pkgs.dockerTools.buildLayeredImage {
             name = "ilink-web";
             tag = "latest";
-            # Libraries NVIDIA's Vulkan driver needs but the toolkit does not
-            # bring, in /lib where the driver looks for them.
-            contents = [
-              pkgs.libglvnd
-              pkgs.libx11
-              pkgs.libxext
+            contents = with pkgs; [
+              # Libraries NVIDIA's Vulkan driver needs but the toolkit does
+              # not bring, in /lib where the driver looks for them.
+              libglvnd
+              libx11
+              libxext
+              # /bin/sh with curl and jq, for --ice-servers-command, and the
+              # CA certificates curl checks servers against.
+              dockerTools.binSh
+              curl
+              jq
+              dockerTools.caCertificates
             ];
             config = {
               # tini runs as PID 1 and passes on SIGTERM, which ilink-web would

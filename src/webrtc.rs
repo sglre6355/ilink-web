@@ -53,8 +53,6 @@ pub struct Options {
     /// STUN server to learn this machine's public address from, so that
     /// viewers can reach it through NAT and TURN relays.
     pub stun: Option<String>,
-    /// The `iceServers` list the page hands to `RTCPeerConnection`, as JSON.
-    pub ice_servers: String,
 }
 
 pub struct Hub {
@@ -114,10 +112,6 @@ impl Hub {
             thread::spawn(move || hub.query_public_address(&server));
         }
         Ok(hub)
-    }
-
-    pub fn ice_servers(&self) -> &str {
-        &self.options.ice_servers
     }
 
     fn routes(&self) -> MutexGuard<'_, Routes> {

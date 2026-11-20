@@ -49,9 +49,28 @@ This is the fastest way to watch from elsewhere, as long as Tailscale
 connects the devices directly; `tailscale status` says `direct` rather than
 `relay` when it does.
 
-### On the internet, through Cloudflare
+### On the internet
 
-To share it with people anywhere, without opening ports on your router,
+To share it with people anywhere, the page needs to be reachable over HTTPS
+behind a login, and the video, which is UDP, needs a way in. Without a
+forwarded port on your router, that way is a TURN server: each viewer's
+browser sends the video through it, and `ilink-web` learns its own public
+address from a STUN server so that the video can come in through the router.
+
+`--ice-servers-command` gives the page its TURN servers. It runs a shell
+command each time a page connects and passes on what it prints, an
+`{"iceServers": [...]}` object as `RTCPeerConnection` takes it. A TURN
+service's short-lived credentials can be fetched that way, and a fixed list
+can come from `cat servers.json`. Credentials in it are handed to every
+viewer, so they should expire or belong to an account made for this.
+
+No setup removes the time light takes: between London and Tokyo, for
+example, every round trip takes about a quarter of a second, so the picture
+trails by roughly that much and the camera answers a key press a little
+later still.
+
+#### With Cloudflare
+
 Cloudflare can carry all of it: a Tunnel serves the page over HTTPS, Access
 lets in only the people you name, and its TURN service relays the video.
 
@@ -71,41 +90,41 @@ lets in only the people you name, and its TURN service relays the video.
    one-time code sent to that address. Do not skip this: `ilink-web` has no
    login of its own, and without Access anyone with the address could watch
    and steer the camera.
-4. **Run both:**
+4. **Credentials.** Save this as `cloudflare-ice-servers.sh`. It asks
+   Cloudflare for credentials that expire after a day, and leaves out the
+   servers on port 53, which browsers do not use:
 
    ```sh
-   export CLOUDFLARE_TURN_KEY_ID=...        # from step 1
-   export CLOUDFLARE_TURN_KEY_API_TOKEN=...
-   ilink-web --listen 127.0.0.1:8081 --udp 0.0.0.0:8081
+   #!/bin/sh
+   curl -sf -X POST \
+     -H "Authorization: Bearer $TURN_KEY_API_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"ttl": 86400}' \
+     "https://rtc.live.cloudflare.com/v1/turn/keys/$TURN_KEY_ID/credentials/generate-ice-servers" |
+     jq -c '.iceServers[].urls |= map(select(test(":53([?/]|$)") | not))'
+   ```
+
+5. **Run both:**
+
+   ```sh
+   export TURN_KEY_ID=... TURN_KEY_API_TOKEN=...    # from step 1
+   ilink-web --listen 127.0.0.1:8081 --udp 0.0.0.0:8081 \
+     --stun stun.cloudflare.com:3478 \
+     --ice-servers-command 'sh cloudflare-ice-servers.sh'
    cloudflared tunnel run --url http://127.0.0.1:8081 ilink
    ```
 
 Then send `https://camera.example.com/` to your friends.
 
-The tunnel carries the page and the WebRTC setup but not the video, which is
-UDP. For that, each viewer gets TURN credentials that `ilink-web` generates
-from the key and that expire after a day; the API token itself never leaves
-this machine. The viewer's browser connects to the nearest Cloudflare
-location, and Cloudflare carries the video from there to this machine, which
-learns its own public address from Cloudflare's STUN server so that the
-video can come in through your router without a forwarded port. `--udp`
-opens the UDP port on every interface, since loopback alone cannot reach the
-internet.
-
-No setup removes the time light takes: between London and Tokyo, for
-example, every round trip takes about a quarter of a second, so the picture
-trails by roughly that much and the camera answers a key press a little
-later still.
-
-Any other TURN server works too, with `--turn`, `--turn-user` and
-`--turn-password` in place of the Cloudflare key; the user name and password
-are then handed to every viewer as they are.
+The tunnel carries the page and the WebRTC setup, and Cloudflare's TURN
+service the video, from the location nearest each viewer to this machine. The
+API token stays on this machine. `--udp` opens the UDP port on every
+interface, since loopback alone cannot reach the internet.
 
 ### In a container
 
-The flake builds a container image of about 35 MB that holds `ilink-web`
-and the libraries it links, and nothing else: no distribution, shell or
-package manager.
+The flake builds a container image that holds `ilink-web` and the libraries
+it links, plus a shell, `curl` and `jq` for `--ice-servers-command`, and
+nothing else: no distribution or package manager.
 
 ```sh
 nix build .#image
@@ -125,9 +144,11 @@ podman run --rm --network host --userns keep-id --user "$(id -u):$(id -g)" \
 
 With Docker, give it the camera's group instead, by number since the image
 has no group names: `--group-add "$(getent group video | cut -d: -f3)"`.
-Options after the image name go to `ilink-web`, and the Cloudflare TURN
-variables pass in with `-e CLOUDFLARE_TURN_KEY_ID -e
-CLOUDFLARE_TURN_KEY_API_TOKEN`.
+Options after the image name go to `ilink-web`. A script for
+`--ice-servers-command` goes in with `-v`, and the variables it reads with
+`-e`, such as `-v ./cloudflare-ice-servers.sh:/ice-servers.sh:ro -e
+TURN_KEY_ID -e TURN_KEY_API_TOKEN` and then
+`--ice-servers-command 'sh /ice-servers.sh'`.
 
 The image carries no GPU drivers. It encodes on the GPU when the host's
 drivers are passed in, and with OpenH264 on the CPU otherwise, where 1080p
@@ -156,8 +177,7 @@ would not find its files.
 
 ```
 ilink-web [-l ADDR] [-u ADDR] [-d PATH] [-r WxH] [-f N] [--max-bitrate KBPS]
-          [--stun HOST:PORT] [--turn URL --turn-user NAME --turn-password PASSWORD]
-          [--cloudflare-turn-key ID --cloudflare-turn-token TOKEN]
+          [--stun HOST:PORT] [--ice-servers-command COMMAND]
 ```
 
 - `-l, --listen ADDR` is where to serve the page. The default,
@@ -175,16 +195,12 @@ ilink-web [-l ADDR] [-u ADDR] [-d PATH] [-r WxH] [-f N] [--max-bitrate KBPS]
   8000 (8 Mbit/s); the actual rate follows what the connection can take.
 - `--stun HOST:PORT` is a STUN server, such as `stun.cloudflare.com:3478`.
   `ilink-web` asks it for this machine's public address and offers that to
-  viewers, and the page uses it too.
-- `--turn URL`, `--turn-user NAME` and `--turn-password PASSWORD` give a TURN
-  server for viewers that cannot reach this machine directly. A `turn:` URL
-  also serves as the STUN server when `--stun` is not given.
-- `--cloudflare-turn-key ID` and `--cloudflare-turn-token TOKEN`, or the
-  `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_KEY_API_TOKEN` environment
-  variables, use Cloudflare's TURN service instead: each viewer gets
-  credentials generated from the key, and `stun.cloudflare.com` serves as the
-  STUN server unless `--stun` is given. The environment variables keep the
-  token out of the process list.
+  viewers, and the page uses it too unless `--ice-servers-command` is given.
+- `--ice-servers-command COMMAND` is a shell command that prints the page's
+  `{"iceServers": [...]}` as JSON, for TURN servers; see
+  [On the internet](#on-the-internet). It runs each time a page connects, and
+  if it fails or takes over 10 seconds the page gets the `--stun` server
+  alone.
 
 If the camera is missing at startup, or is unplugged later, `ilink-web` keeps
 running and opens it again on the next request.
@@ -236,10 +252,9 @@ Tailscale address, or put Cloudflare Access (or another login) in front of it
 as described above.
 
 The UDP port only talks to browsers that have set up a session through the
-page, and the video is encrypted. TURN credentials are handed to every
-viewer, since their browsers log in to the TURN server: Cloudflare ones expire
-after a day, but a `--turn-password` does not, so use a TURN account made for
-this.
+page, and the video is encrypted. TURN credentials from
+`--ice-servers-command` are handed to every viewer, since their browsers log
+in to the TURN server, so use ones that expire or an account made for this.
 
 ## HTTP API
 

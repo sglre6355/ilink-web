@@ -6,8 +6,8 @@
 mod encode;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod ice;
 mod stun;
-mod turn;
 mod video;
 mod webrtc;
 
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use insta360_link::{Camera, PanTiltUpdate};
 
-use turn::CloudflareTurn;
+use ice::IceServers;
 use video::Video;
 use webrtc::Hub;
 
@@ -60,87 +60,15 @@ struct Args {
           value_parser = clap::value_parser!(u32).range(200..=50000))]
     max_bitrate: u32,
 
-    /// STUN server (HOST:PORT) for learning this machine's public address
+    /// STUN server (HOST:PORT) to learn this machine's public address from;
+    /// the page also gets it unless --ice-servers-command is given
     #[arg(long, value_name = "HOST:PORT")]
     stun: Option<String>,
 
-    /// TURN server for viewers that cannot reach this machine directly, such
-    /// as turn:turn.example.com:3478
-    #[arg(long, value_name = "URL", requires_all = ["turn_user", "turn_password"])]
-    turn: Option<String>,
-
-    /// User name for the TURN server
-    #[arg(long, value_name = "NAME", requires = "turn")]
-    turn_user: Option<String>,
-
-    /// Password for the TURN server; it is handed to every viewer
-    #[arg(long, value_name = "PASSWORD", requires = "turn")]
-    turn_password: Option<String>,
-
-    /// Cloudflare TURN key ID; viewers get short-lived credentials made from
-    /// it, and Cloudflare's STUN server is used unless --stun is given
-    #[arg(
-        long,
-        value_name = "ID",
-        env = "CLOUDFLARE_TURN_KEY_ID",
-        requires = "cloudflare_turn_token",
-        conflicts_with = "turn"
-    )]
-    cloudflare_turn_key: Option<String>,
-
-    /// API token of the Cloudflare TURN key
-    #[arg(
-        long,
-        value_name = "TOKEN",
-        env = "CLOUDFLARE_TURN_KEY_API_TOKEN",
-        hide_env_values = true,
-        requires = "cloudflare_turn_key"
-    )]
-    cloudflare_turn_token: Option<String>,
-}
-
-impl Args {
-    /// The `iceServers` list for the page's `RTCPeerConnection`.
-    fn ice_servers(&self) -> String {
-        let mut servers = Vec::new();
-        if let Some(stun) = &self.stun {
-            servers.push(format!(r#"{{"urls":"stun:{}"}}"#, json_escape(stun)));
-        }
-        if let (Some(url), Some(user), Some(password)) =
-            (&self.turn, &self.turn_user, &self.turn_password)
-        {
-            servers.push(format!(
-                r#"{{"urls":"{}","username":"{}","credential":"{}"}}"#,
-                json_escape(url),
-                json_escape(user),
-                json_escape(password)
-            ));
-        }
-        format!(r#"{{"iceServers":[{}]}}"#, servers.join(","))
-    }
-
-    /// Where to ask for this machine's public address: the STUN server,
-    /// Cloudflare's when using its TURN service, or failing that a plain-UDP
-    /// TURN server, which answers STUN requests too.
-    fn stun_server(&self) -> Option<String> {
-        if let Some(stun) = &self.stun {
-            return Some(stun.clone());
-        }
-        if self.cloudflare_turn_key.is_some() {
-            return Some(turn::STUN_SERVER.to_string());
-        }
-        let rest = self.turn.as_deref()?.strip_prefix("turn:")?;
-        let host = rest.split('?').next()?;
-        let has_port = !host.ends_with(']')
-            && host
-                .rsplit_once(':')
-                .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
-        Some(if has_port {
-            host.to_string()
-        } else {
-            format!("{host}:3478")
-        })
-    }
+    /// Shell command printing the page's `{"iceServers": [...]}` as JSON,
+    /// run each time a page connects; for TURN servers and their credentials
+    #[arg(long, value_name = "COMMAND")]
+    ice_servers_command: Option<String>,
 }
 
 fn resolution(value: &str) -> Result<(u32, u32), String> {
@@ -260,7 +188,7 @@ struct Server {
     link: Mutex<Option<Link>>,
     video: Arc<Video>,
     hub: Arc<Hub>,
-    turn: Option<CloudflareTurn>,
+    ice_servers: IceServers,
 }
 
 impl Server {
@@ -287,18 +215,6 @@ impl Server {
                 ("500 Internal Server Error", error_json(&error.to_string()))
             }
         }
-    }
-
-    /// The `iceServers` for the page: fresh Cloudflare credentials if
-    /// configured, otherwise the servers given on the command line.
-    fn ice_servers(&self) -> String {
-        if let Some(turn) = &self.turn {
-            match turn.ice_servers() {
-                Ok(json) => return json,
-                Err(error) => eprintln!("ilink-web: {error}"),
-            }
-        }
-        self.hub.ice_servers().to_string()
     }
 
     /// Runs an API call given as a path with a query string and returns the
@@ -365,7 +281,7 @@ impl Server {
                 }
             }
             "/webrtc" => {
-                let servers = self.ice_servers();
+                let servers = self.ice_servers.json();
                 respond(
                     &mut stream,
                     "200 OK",
@@ -506,8 +422,7 @@ fn main() -> ExitCode {
         video: Arc::clone(&video),
         fps: args.fps,
         max_bitrate: args.max_bitrate * 1000,
-        stun: args.stun_server(),
-        ice_servers: args.ice_servers(),
+        stun: args.stun.clone(),
     };
     let udp = args.udp.unwrap_or(args.listen);
     let hub = match Hub::start(udp, options) {
@@ -517,14 +432,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let turn = args
-        .cloudflare_turn_key
-        .zip(args.cloudflare_turn_token)
-        .map(|(key, token)| CloudflareTurn::new(key, token));
     let server = Arc::new(Server {
         video,
         hub,
-        turn,
+        ice_servers: IceServers::new(args.ice_servers_command, args.stun),
         device: args.device,
         link: Mutex::new(None),
     });
@@ -582,72 +493,6 @@ mod tests {
             error_json("bad \"value\"\n\\"),
             r#"{"error":"bad \"value\" \\"}"#
         );
-    }
-
-    #[test]
-    fn ice_servers_list_stun_and_turn() {
-        let args = Args::parse_from([
-            "ilink-web",
-            "--stun",
-            "stun.example.com:3478",
-            "--turn",
-            "turn:turn.example.com?transport=udp",
-            "--turn-user",
-            "me",
-            "--turn-password",
-            "p\"w",
-        ]);
-        assert_eq!(
-            args.ice_servers(),
-            r#"{"iceServers":[{"urls":"stun:stun.example.com:3478"},{"urls":"turn:turn.example.com?transport=udp","username":"me","credential":"p\"w"}]}"#
-        );
-        assert_eq!(args.stun_server().as_deref(), Some("stun.example.com:3478"));
-        let plain = Args::parse_from(["ilink-web"]);
-        assert_eq!(plain.ice_servers(), r#"{"iceServers":[]}"#);
-        assert_eq!(plain.stun_server(), None);
-    }
-
-    #[test]
-    fn turn_server_doubles_as_stun_server() {
-        let turn = |url: &str| {
-            let args = [
-                "ilink-web",
-                "--turn",
-                url,
-                "--turn-user",
-                "u",
-                "--turn-password",
-                "p",
-            ];
-            Args::parse_from(args).stun_server()
-        };
-        assert_eq!(
-            turn("turn:t.example.com").as_deref(),
-            Some("t.example.com:3478")
-        );
-        assert_eq!(
-            turn("turn:t.example.com:3479?transport=udp").as_deref(),
-            Some("t.example.com:3479")
-        );
-        assert_eq!(turn("turns:t.example.com:5349"), None);
-    }
-
-    #[test]
-    fn cloudflare_turn_uses_cloudflare_stun() {
-        let cloudflare = ["--cloudflare-turn-key", "k", "--cloudflare-turn-token", "t"];
-        let args = Args::try_parse_from(["ilink-web"].iter().chain(&cloudflare)).unwrap();
-        assert_eq!(args.stun_server().as_deref(), Some(turn::STUN_SERVER));
-        let with_turn = [
-            "ilink-web",
-            "--turn",
-            "turn:x",
-            "--turn-user",
-            "u",
-            "--turn-password",
-            "p",
-        ];
-        assert!(Args::try_parse_from(with_turn.iter().chain(&cloudflare)).is_err());
-        assert!(Args::try_parse_from(["ilink-web", "--cloudflare-turn-key", "k"]).is_err());
     }
 
     #[test]
